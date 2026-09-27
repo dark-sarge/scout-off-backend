@@ -1,6 +1,8 @@
 import { EventEmitter } from 'events';
 import { ContractEventType } from '../types';
 import { logger } from '../utils/logger';
+import { getRedisSubscriberClient, publishSseEvent, subscribeSseEvents } from './redis';
+import config from '../config';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -150,10 +152,44 @@ export function isEventMatchingFilter(
   return true;
 }
 
+// ─── Metrics helpers ──────────────────────────────────────────────────────────
+
+let metrics = {
+  published: 0,
+  received: 0,
+  localBroadcasts: 0,
+  redisBroadcasts: 0,
+};
+
+/** Reset metrics — only for tests. */
+export function _resetMetrics(): void {
+  metrics = { published: 0, received: 0, localBroadcasts: 0, redisBroadcasts: 0 };
+}
+
+/** Return current metrics. */
+export function _getMetrics(): typeof metrics {
+  return { ...metrics };
+}
+
+// ─── Instance identification ──────────────────────────────────────────────────
+
+/**
+ * Unique ID for this process instance.
+ * Used to avoid echoing back our own Redis publishes.
+ */
+const INSTANCE_ID = `${config.redisUrl ? 'redis:' : 'local:'}${Math.random().toString(36).slice(2, 10)}`;
+
 // ─── EventBroadcaster ────────────────────────────────────────────────────────
 
 /**
- * Singleton in-process pub/sub bus for SSE.
+ * Singleton in-process pub/sub bus for SSE with Redis cross-instance
+ * message transport.
+ *
+ * - When Redis is configured, each broadcast is published to Redis (PUBLISH)
+ *   and each instance subscribes (SUBSCRIBE) to events from other instances.
+ * - Events from the same origin are skipped to avoid double delivery.
+ * - When Redis is NOT configured, the behavior equals the original single-instance
+ *   mode: only local broadcasts to in-process subscribers.
  *
  * The indexer calls `broadcast(event)` after persisting each batch of events.
  * The SSE route handler calls `subscribe(subscriber)` on connection and
@@ -170,6 +206,9 @@ export class EventBroadcaster extends EventEmitter {
   /** Active subscriber list — used for connection-count metrics. */
   private _subscribers: Set<SseSubscriber> = new Set();
 
+  /** Optional Redis unsubscribe function if Redis is configured. */
+  private _redisUnsubscribe?: () => void;
+
   private constructor() {
     super();
     // Raise the default max-listeners cap: each SSE connection adds one
@@ -180,7 +219,9 @@ export class EventBroadcaster extends EventEmitter {
   /** Return (or lazily create) the process-wide singleton. */
   static getInstance(): EventBroadcaster {
     if (!EventBroadcaster._instance) {
-      EventBroadcaster._instance = new EventBroadcaster();
+      const instance = new EventBroadcaster();
+      instance._setupRedis();
+      EventBroadcaster._instance = instance;
     }
     return EventBroadcaster._instance;
   }
@@ -199,6 +240,43 @@ export class EventBroadcaster extends EventEmitter {
   /** Number of currently connected SSE subscribers. */
   get subscriberCount(): number {
     return this._subscribers.size;
+  }
+
+  /**
+   * Set up Redis pub/sub if configured.
+   * Reads from the singleton instance to avoid circular dependency.
+   */
+  private _setupRedis(): void {
+    if (!config.redisUrl) {
+      logger.info('[eventBroadcaster] Redis not configured; using in-process-only mode');
+      return;
+    }
+
+    const subscriber = getRedisSubscriberClient();
+    if (!subscriber) {
+      logger.warn('[eventBroadcaster] Redis subscriber unavailable; using in-process-only mode');
+      return;
+    }
+
+    // Subscribe to SSE events from other instances
+    this._redisUnsubscribe = subscribeSseEvents((data: unknown) => {
+      const msg = data as { type: string; payload: Record<string, unknown>; origin: string };
+      metrics.received++;
+      
+      // Skip events from our own origin (avoid echo)
+      if (msg.origin === INSTANCE_ID) {
+        return;
+      }
+      
+      // Local broadcast to subscribers
+      metrics.localBroadcasts++;
+      this.emit(EventBroadcaster.CHANNEL, {
+        type: msg.type as ContractEventType,
+        payload: msg.payload,
+      });
+    });
+
+    logger.info('[eventBroadcaster] Redis pub/sub enabled; subscribed to sse:events channel');
   }
 
   /**
@@ -255,12 +333,48 @@ export class EventBroadcaster extends EventEmitter {
   /**
    * Emit an event to all relevant subscribers.
    * Called by the indexer after persisting a batch of events.
+   * 
+   * When Redis is configured, the event is also published to Redis so other
+   * instances can receive it. Events are deduped by origin to avoid double
+   * delivery when both a controller and the indexer emit the same logical event.
    */
   broadcast(event: BroadcastEvent): void {
     logger.debug(`[eventBroadcaster] broadcast type=${event.type} subscribers=${this._subscribers.size}`);
+    
+    const origin = INSTANCE_ID;
+    
+    // Publish to Redis if available
+    const redisPublished = publishSseEvent({
+      type: event.type,
+      payload: event.payload,
+      origin,
+    });
+    
+    if (redisPublished) {
+      metrics.published++;
+      metrics.redisBroadcasts++;
+    } else {
+      metrics.published++;
+    }
+    
+    // Local broadcast to in-process subscribers
     this.emit(EventBroadcaster.CHANNEL, event);
+  }
+  
+  /**
+   * Clean up Redis subscription on destroy.
+   */
+  _cleanup(): void {
+    if (this._redisUnsubscribe) {
+      this._redisUnsubscribe();
+      this._redisUnsubscribe = undefined;
+    }
   }
 }
 
 /** Convenience accessor for the singleton. */
+/** Convenience accessor for the singleton. */
 export const broadcaster = EventBroadcaster.getInstance();
+
+/** Export metrics helpers for tests and monitoring. */
+export { _resetMetrics, _getMetrics };

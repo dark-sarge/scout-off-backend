@@ -92,6 +92,70 @@ export function getRedisSubscriberClient(): Redis | null {
 }
 
 /**
+ * Publish an event to the SSE event channel.
+ *
+ * Returns `true` if Redis was available and the PUBLISH succeeded,
+ * `false` if Redis is not configured or the publish failed.
+ *
+ * The payload is a JSON-serialized BroadcastEvent. Each instance receives
+ * the message and rebroadcasts locally (if not the origin instance).
+ */
+export function publishSseEvent(event: {
+  type: string;
+  payload: Record<string, unknown>;
+  origin: string;
+}): boolean {
+  const client = getRedisSubscriberClient();
+  if (!client) {
+    return false;
+  }
+  const channel = 'sse:events';
+  const message = JSON.stringify(event);
+  try {
+    client.PUBLISH(channel, message);
+    return true;
+  } catch (err) {
+    logger.warn(`[redis] failed to publish event to ${channel}: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
+/**
+ * Subscribe to SSE events from other instances.
+ *
+ * Calls `onEvent` for each message received on the `sse:events` channel.
+ * The caller is responsible for deduplicating events from the same origin.
+ */
+export function subscribeSseEvents(onEvent: (data: unknown) => void): () => void {
+  const client = getRedisSubscriberClient();
+  if (!client) {
+    // No-op when Redis is not available
+    return () => {};
+  }
+  
+  client.on('pmessage', (pattern: string, channel: string, data: string) => {
+    if (channel === 'sse:events') {
+      try {
+        onEvent(JSON.parse(data));
+      } catch (err) {
+        logger.warn(`[redis] failed to parse SSE event message: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  });
+  
+  client.subscribe('sse:events', (err) => {
+    if (err) {
+      logger.error(`[redis] failed to subscribe to sse:events: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
+  
+  // Return unsubscribe function
+  return () => {
+    client.unsubscribe('sse:events');
+  };
+}
+
+/**
  * Close both Redis connections used by this module (the command client and the
  * pub/sub subscriber). Safe to call when Redis is not configured or already
  * closed; failures are logged and swallowed so shutdown is never blocked.

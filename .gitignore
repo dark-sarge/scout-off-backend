@@ -26,3 +26,6 @@ pr-808.md
 pr-807.md
 jest.scoutNotes.config.js
 
+# Kiro-generated files and temporary artifacts
+k/
+

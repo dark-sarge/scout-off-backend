@@ -3,10 +3,7 @@
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec};
 use scout_off_shared::{
     errors::Error,
-    storage::{
-        add_authorized_updater, bump_instance, get_authorized_updaters, is_authorized_updater,
-        is_initialized, is_paused, remove_authorized_updater, set_initialized, set_paused,
-    },
+    storage::{add_authorized_updater, bump_instance, get_authorized_updaters, is_authorized_updater, is_initialized, is_paused, remove_authorized_updater, set_initialized, set_paused, MAX_PAGE_SIZE},
 };
 
 // ---------------------------------------------------------------------------
@@ -469,6 +466,80 @@ impl RegisterContract {
             }
         }
         results
+    }
+
+    /// Return a page of players matching the given region, position, and minimum progress tier.
+    /// 
+    /// This is the paginated variant of [`filter_players`]. It returns at most `limit` players
+    /// starting from the given `start` index. Use `next` in the returned [`Page`] to fetch
+    /// subsequent pages until it is `None`.
+    /// 
+    /// # Arguments
+    /// * `region` - Geographic region to filter by (e.g. "europe")
+    /// * `position` - Playing position to filter by (e.g. "forward")
+    /// * `min_tier` - Minimum progress level to filter by
+    /// * `start` - Zero-based index of the first result to return
+    /// * `limit` - Maximum number of results to return (capped at MAX_PAGE_SIZE = 50)
+    /// 
+    /// # Returns
+    /// A [`Page<PlayerData>`] containing:
+    /// * `items`: The slice of matching players for this page
+    /// * `next`: The start index for the next page, or `None` if no more results
+    /// 
+    /// # Errors
+    /// * [`Error::InvalidInput`] — `start` or `limit` is invalid
+    /// 
+    /// # Budget
+    /// This function has a fixed CPU/memory cost independent of total player count.
+    /// It reads only the requested slice of the PlayerList and fetches only the
+    /// requested PlayerData entries.
+    pub fn filter_players_page(
+        env: Env,
+        region: String,
+        position: String,
+        min_tier: u32,
+        start: u32,
+        limit: u32,
+    ) -> Result<Page<PlayerData>, Error> {
+        // Validate inputs
+        if limit == 0 {
+            return Err(Error::InvalidInput);
+        }
+        let max_limit = MAX_PAGE_SIZE;
+        let effective_limit = limit.min(max_limit);
+        
+        let list: Vec<u64> = match env.storage().instance().get(&DataKey::PlayerList) {
+            Some(l) => l,
+            None => return Ok(Page { items: Vec::new(&env), next: None }),
+        };
+
+        let total = list.len() as u32;
+        if start >= total {
+            return Ok(Page { items: Vec::new(&env), next: None });
+        }
+
+        let end = (start + effective_limit).min(total);
+        
+        let mut results = Vec::new(&env);
+        for i in start..end {
+            let player_id = list.get_unchecked(i as usize);
+            if let Some(player) = env
+                .storage()
+                .instance()
+                .get::<DataKey, PlayerData>(&DataKey::Player(player_id))
+            {
+                if player.region == region
+                    && player.position == position
+                    && player.progress_level >= min_tier
+                {
+                    results.push_back(player);
+                }
+            }
+        }
+        
+        let next = if end < total { Some(end) } else { None };
+        
+        Ok(Page { items: results, next })
     }
 }
 

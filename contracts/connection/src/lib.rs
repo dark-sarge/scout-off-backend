@@ -5,7 +5,7 @@ use soroban_sdk::{
 };
 use scout_off_shared::{
     errors::Error,
-    storage::{bump_instance, is_initialized, is_paused, set_initialized, set_paused},
+    storage::{bump_instance, is_initialized, is_paused, MAX_PAGE_SIZE, Page, set_initialized, set_paused},
 };
 
 // ---------------------------------------------------------------------------
@@ -484,6 +484,201 @@ impl ConnectionContract {
             }
         }
         results
+    }
+
+    /// Return a page of connection records for a scout.
+    /// 
+    /// This is the paginated variant of [`list_connections`]. It returns at most `limit` connections
+    /// starting from the given `start` index. Use `next` in the returned [`Page`] to fetch
+    /// subsequent pages until it is `None`.
+    /// 
+    /// # Arguments
+    /// * `scout` - The scout address whose connections to list
+    /// * `start` - Zero-based index of the first connection to return
+    /// * `limit` - Maximum number of connections to return (capped at MAX_PAGE_SIZE = 50)
+    /// 
+    /// # Returns
+    /// A [`Page<ConnectionRecord>`] containing:
+    /// * `items`: The slice of connections for this page
+    /// * `next`: The start index for the next page, or `None` if no more results
+    /// 
+    /// # Errors
+    /// * [`Error::InvalidInput`] — `start` or `limit` is invalid
+    pub fn list_connections_page(
+        env: Env,
+        scout: Address,
+        start: u32,
+        limit: u32,
+    ) -> Result<Page<ConnectionRecord>, Error> {
+        // Validate inputs
+        if limit == 0 {
+            return Err(Error::InvalidInput);
+        }
+        let max_limit = MAX_PAGE_SIZE;
+        let effective_limit = limit.min(max_limit);
+        
+        let player_ids: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ScoutConnections(scout.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = player_ids.len() as u32;
+        if start >= total {
+            return Ok(Page { items: Vec::new(&env), next: None });
+        }
+
+        let end = (start + effective_limit).min(total);
+        
+        let mut results = Vec::new(&env);
+        for i in start..end {
+            let pid = player_ids.get_unchecked(i as usize);
+            if let Some(record) = env
+                .storage()
+                .instance()
+                .get::<DataKey, ConnectionRecord>(&DataKey::Connection(scout.clone(), pid))
+            {
+                results.push_back(record);
+            }
+        }
+        
+        let next = if end < total { Some(end) } else { None };
+        
+        Ok(Page { items: results, next })
+    }
+
+    /// Return a page of trial offer records for a given player.
+    /// 
+    /// This is the paginated variant of [`get_connections`]. It returns at most `limit` records
+    /// starting from the given `start` index. Use `next` in the returned [`Page`] to fetch
+    /// subsequent pages until it is `None`.
+    /// 
+    /// # Arguments
+    /// * `player_id` - The player ID whose trial offers to list
+    /// * `start` - Zero-based index of the first record to return
+    /// * `limit` - Maximum number of records to return (capped at MAX_PAGE_SIZE = 50)
+    /// 
+    /// # Returns
+    /// A [`Page<TrialOfferRecord>`] containing:
+    /// * `items`: The slice of trial offers for this page
+    /// * `next`: The start index for the next page, or `None` if no more results
+    /// 
+    /// # Errors
+    /// * [`Error::InvalidInput`] — `start` or `limit` is invalid
+    pub fn get_connections_page(
+        env: Env,
+        player_id: u64,
+        start: u32,
+        limit: u32,
+    ) -> Result<Page<TrialOfferRecord>, Error> {
+        // Validate inputs
+        if limit == 0 {
+            return Err(Error::InvalidInput);
+        }
+        let max_limit = MAX_PAGE_SIZE;
+        let effective_limit = limit.min(max_limit);
+        
+        let scouts: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlayerConnections(player_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = scouts.len() as u32;
+        if start >= total {
+            return Ok(Page { items: Vec::new(&env), next: None });
+        }
+
+        let end = (start + effective_limit).min(total);
+        
+        let mut results = Vec::new(&env);
+        for i in start..end {
+            let scout = scouts.get_unchecked(i as usize);
+            let offer_key = DataKey::TrialOfferKey(scout.clone(), player_id);
+            if let Some(data) = env
+                .storage()
+                .instance()
+                .get::<DataKey, TrialOfferData>(&offer_key)
+            {
+                results.push_back(TrialOfferRecord {
+                    scout,
+                    player_id,
+                    details_uri: data.details_uri,
+                    created_at: data.created_at,
+                });
+            }
+        }
+        
+        let next = if end < total { Some(end) } else { None };
+        
+        Ok(Page { items: results, next })
+    }
+
+    /// Return a page of trial offers made by a given scout.
+    /// 
+    /// This is the paginated variant of [`get_trial_offers`]. It returns at most `limit` records
+    /// starting from the given `start` index. Use `next` in the returned [`Page`] to fetch
+    /// subsequent pages until it is `None`.
+    /// 
+    /// # Arguments
+    /// * `scout` - The scout address whose trial offers to list
+    /// * `start` - Zero-based index of the first record to return
+    /// * `limit` - Maximum number of records to return (capped at MAX_PAGE_SIZE = 50)
+    /// 
+    /// # Returns
+    /// A [`Page<TrialOfferRecord>`] containing:
+    /// * `items`: The slice of trial offers for this page
+    /// * `next`: The start index for the next page, or `None` if no more results
+    /// 
+    /// # Errors
+    /// * [`Error::InvalidInput`] — `start` or `limit` is invalid
+    pub fn get_trial_offers_page(
+        env: Env,
+        scout: Address,
+        start: u32,
+        limit: u32,
+    ) -> Result<Page<TrialOfferRecord>, Error> {
+        // Validate inputs
+        if limit == 0 {
+            return Err(Error::InvalidInput);
+        }
+        let max_limit = MAX_PAGE_SIZE;
+        let effective_limit = limit.min(max_limit);
+        
+        let player_ids: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ScoutOffers(scout.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = player_ids.len() as u32;
+        if start >= total {
+            return Ok(Page { items: Vec::new(&env), next: None });
+        }
+
+        let end = (start + effective_limit).min(total);
+        
+        let mut results = Vec::new(&env);
+        for i in start..end {
+            let player_id = player_ids.get_unchecked(i as usize);
+            let offer_key = DataKey::TrialOfferKey(scout.clone(), player_id);
+            if let Some(data) = env
+                .storage()
+                .instance()
+                .get::<DataKey, TrialOfferData>(&offer_key)
+            {
+                results.push_back(TrialOfferRecord {
+                    scout: scout.clone(),
+                    player_id,
+                    details_uri: data.details_uri,
+                    created_at: data.created_at,
+                });
+            }
+        }
+        
+        let next = if end < total { Some(end) } else { None };
+        
+        Ok(Page { items: results, next })
     }
 }
 

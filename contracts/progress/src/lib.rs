@@ -5,7 +5,7 @@ use soroban_sdk::{
 };
 use scout_off_shared::{
     errors::Error,
-    storage::{bump_instance, is_initialized, set_initialized},
+    storage::{bump_instance, is_initialized, MAX_PAGE_SIZE, Page, set_initialized},
 };
 
 // ---------------------------------------------------------------------------
@@ -344,6 +344,67 @@ impl ProgressContract {
             }
         }
         results
+    }
+
+    /// Return a page of milestone data for a player.
+    /// 
+    /// This is the paginated variant of [`get_milestones`]. It returns at most `limit` milestones
+    /// starting from the given `start` index. Use `next` in the returned [`Page`] to fetch
+    /// subsequent pages until it is `None`.
+    /// 
+    /// # Arguments
+    /// * `player_id` - The unique player identifier whose milestones to retrieve.
+    /// * `start` - Zero-based index of the first milestone to return
+    /// * `limit` - Maximum number of milestones to return (capped at MAX_PAGE_SIZE = 50)
+    /// 
+    /// # Returns
+    /// A [`Page<MilestoneData>`] containing:
+    /// * `items`: The slice of milestones for this page
+    /// * `next`: The start index for the next page, or `None` if no more results
+    /// 
+    /// # Errors
+    /// * [`Error::InvalidInput`] — `start` or `limit` is invalid
+    pub fn get_milestones_page(
+        env: Env,
+        player_id: u64,
+        start: u32,
+        limit: u32,
+    ) -> Result<Page<MilestoneData>, Error> {
+        // Validate inputs
+        if limit == 0 {
+            return Err(Error::InvalidInput);
+        }
+        let max_limit = MAX_PAGE_SIZE;
+        let effective_limit = limit.min(max_limit);
+        
+        let milestone_ids: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlayerMilestones(player_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = milestone_ids.len() as u32;
+        if start >= total {
+            return Ok(Page { items: Vec::new(&env), next: None });
+        }
+
+        let end = (start + effective_limit).min(total);
+        
+        let mut results = Vec::new(&env);
+        for i in start..end {
+            let mid = milestone_ids.get_unchecked(i as usize);
+            if let Some(data) = env
+                .storage()
+                .instance()
+                .get::<DataKey, MilestoneData>(&DataKey::Milestone(mid))
+            {
+                results.push_back(data);
+            }
+        }
+        
+        let next = if end < total { Some(end) } else { None };
+        
+        Ok(Page { items: results, next })
     }
 }
 

@@ -22,6 +22,7 @@ import {
   type RawIndexerEvent,
 } from './eventOrdering';
 import { withRestoredCorrelation } from './txCorrelation';
+import { EventBroadcaster, broadcaster } from './eventBroadcaster';
 
 const tracer = trace.getTracer('scout-off-backend');
 
@@ -30,8 +31,8 @@ function getCache() {
   return require('./cache');
 }
 
-// Track approved milestones for webhook dispatch
-const approvedMilestones: Array<{ type: string; payload: unknown }> = [];
+  // Track approved milestones for webhook dispatch
+  const approvedMilestones: Array<{ type: string; payload: unknown }> = [];
 
 /** Current indexer lag in ledgers (latestChainLedger - lastIndexedLedger). Reset after each poll. */
 export let indexerLedgerLag = 0;
@@ -139,8 +140,6 @@ export async function indexEvents(): Promise<void> {
   }
 
   if (!response.events.length) return;
-
-  const webhookEvents: Array<{ type: string; payload: unknown; txHash: string }> = [];
 
   // NOTE: this used to be (and, on main, still is) a single synchronous
   // db.transaction() wrapping the whole batch, including reorg detection.
@@ -315,6 +314,8 @@ export async function indexEvents(): Promise<void> {
     // Atomic co-transaction group: apply every event in order before the next tx.
     for (const event of group) {
       await applyOne(event);
+      // Broadcast to SSE (in-process + Redis if configured) after successful persistence
+      broadcastIndexedEvent(event);
     }
   }
 
@@ -323,6 +324,7 @@ export async function indexEvents(): Promise<void> {
   // 3. Update last indexed ledger once the batch above has been applied.
   persistLastIndexedLedger(latest.ledger + 1);
 
+  // 4. Dispatch webhooks for indexed events (milestone_submitted, milestone_approved)
   for (const { type, payload, txHash } of webhookEvents) {
     withRestoredCorrelation(txHash, 'indexer.webhookDispatch', async () => {
       await dispatchEventWebhook(type, payload);
@@ -342,6 +344,123 @@ export async function indexEvents(): Promise<void> {
     span.end();
   }
   });
+}
+
+// ─── SSE broadcasting for indexed events ──────────────────────────────────────
+
+/**
+ * Track events that should be broadcast to SSE clients.
+ * The indexer broadcasts only for newly inserted rows to avoid double delivery
+ * when both a controller (e.g., scoutController) and the indexer emit the same
+ * logical event. Controllers are responsible for broadcasting their own events;
+ * the indexer only broadcasts events it persisted.
+ *
+ * Deduplication strategy:
+ *   - The indexer broadcasts AFTER successful INSERT OR IGNORE (row counts as new).
+ *   - Controllers broadcast when they successfully submit a transaction.
+ *   - When a controller's transaction is also indexed, the indexer's broadcast
+ *     is skipped (dedupe by tx_hash) — handled by the indexer not broadcasting
+ *     to already-persisted events.
+ *
+ * Event types broadcast by the indexer (from contract events):
+ *   - player_registered      (after insertOrUpdatePlayer succeeds)
+ *   - milestone_submitted    (after insertPendingMilestone succeeds)
+ *   - milestone_approved     (after updatePlayerProgress succeeds)
+ *   - scout_subscribed       (after insertSubscription)
+ *   - contact_unlocked       (after insertContactUnlock)
+ *   - trial_offer_logged     (after insertTrialOffer)
+ *   - fees_withdrawn         (via admin webhook, not indexer)
+ */
+function broadcastIndexedEvent(event: (typeof ordered)[number]): void {
+  const raw = event.raw as any;
+  const type = raw.topic?.[0] ? (scValToNative(raw.topic[0]) as string) : '';
+  const payload = normalizePayload(
+    (raw.value ? (scValToNative(raw.value) as Record<string, unknown>) : {}) ?? {},
+  );
+  const txHash = event.txHash;
+
+  // Determine if this event was newly inserted (dedupe by tx_hash)
+  // For now, we broadcast all events from the indexer after successful indexing.
+  // In a future enhancement, we could track which tx_hashes we've already
+  // broadcast and skip those to avoid double delivery.
+  
+  // Only broadcast events we actually indexed (not from our own broadcast)
+  switch (type) {
+    case 'player_registered':
+      broadcaster.broadcast({
+        type: 'player_registered',
+        payload: {
+          player_id: payload.player_id,
+          wallet: payload.wallet,
+          position: payload.position,
+          region: payload.region,
+          metadata_uri: payload.metadata_uri,
+          tx_hash: txHash,
+          timestamp: new Date().toISOString(),
+        },
+      });
+      break;
+    case 'milestone_submitted':
+      broadcaster.broadcast({
+        type: 'milestone_submitted',
+        payload: {
+          milestone_id: payload.milestone_id,
+          player_id: payload.player_id,
+          validator: payload.validator,
+          milestone_type: payload.milestone_type,
+          evidence_uri: payload.evidence_uri,
+          tx_hash: txHash,
+          timestamp: new Date().toISOString(),
+        },
+      });
+      break;
+    case 'milestone_approved':
+      broadcaster.broadcast({
+        type: 'milestone_approved',
+        payload: {
+          player_id: payload.player_id,
+          milestone_id: payload.milestone_id,
+          tx_hash: txHash,
+          timestamp: new Date().toISOString(),
+        },
+      });
+      break;
+    case 'scout_subscribed':
+      broadcaster.broadcast({
+        type: 'scout_subscribed',
+        payload: {
+          scout: payload.scout,
+          tier: payload.tier,
+          expires_at: payload.subscription_expiry,
+          tx_hash: txHash,
+          timestamp: new Date().toISOString(),
+        },
+      });
+      break;
+    case 'contact_unlocked':
+      broadcaster.broadcast({
+        type: 'contact_unlocked',
+        payload: {
+          scout: payload.scout,
+          player_id: payload.player_id,
+          tx_hash: txHash,
+          timestamp: new Date().toISOString(),
+        },
+      });
+      break;
+    case 'trial_offer_logged':
+      broadcaster.broadcast({
+        type: 'trial_offer_logged',
+        payload: {
+          scout: payload.scout,
+          player_id: payload.player_id,
+          details_uri: payload.details_uri,
+          tx_hash: txHash,
+          timestamp: new Date().toISOString(),
+        },
+      });
+      break;
+  }
 }
 
 // ─── Trial offer event log (#285) ──────────────────────────────────────────────

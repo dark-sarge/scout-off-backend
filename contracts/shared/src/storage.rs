@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Env, Vec};
+use soroban_sdk::{contracttype, Address, Env, String, Vec};
 
 #[contracttype]
 #[derive(Clone)]
@@ -11,6 +11,18 @@ pub enum DataKey {
     /// cost per Soroban's metered state model).
     AuthorizedUpdaters,
 }
+
+/// A page of results for pagination.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next: Option<u32>,
+}
+
+/// Maximum page size for paginated queries.
+/// This is a hard limit to stay within Soroban CPU/memory/return-size budgets.
+pub const MAX_PAGE_SIZE: u32 = 50;
 
 pub fn is_initialized(env: &Env) -> bool {
     env.storage().instance().has(&DataKey::Initialized)
