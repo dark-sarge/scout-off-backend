@@ -15,16 +15,12 @@
  * Design notes:
  *   • Only one reindex job may run at a time (singleton guard).
  *   • The job runs in the background (fire-and-forget); callers poll status.
- *   • normalizePayload / normalizeEventId from indexer.ts are reused so
- *     deduplication semantics are identical to the normal polling loop.
+ *   • Uses eventBatchProcessor for the core fetch/normalize/insert pipeline.
  *   • RPC 429/rate-limit responses trigger a backoff regardless of mode.
  */
 
-import { server } from './stellar';
-import config from '../config';
-import { getDb, persistLastIndexedLedger } from '../db';
-import { normalizeEventId, normalizeSorobanEvent } from './indexer';
-import { normalizeAndSortEvents, type RawIndexerEvent } from './eventOrdering';
+import { processEventBatches, type BatchProcessorProgress } from './eventBatchProcessor';
+import { persistLastIndexedLedger } from '../db';
 import { logAuditEvent } from './audit';
 import { logger } from '../utils/logger';
 
@@ -228,165 +224,78 @@ async function _runReindex(
   toLedger: number,
   adminWallet: string,
 ): Promise<void> {
-  const db = getDb();
-  const insert = db.prepare(
-    `INSERT OR IGNORE INTO events
-      (type, ledger, tx_hash, payload, created_at, tx_application_order, event_index, contract_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
-
-  let eventsInserted = 0;
-  let currentBatchStart = fromLedger;
   let currentMode: IndexerMode = 'steady';
 
   try {
-    while (currentBatchStart <= toLedger) {
-      const remaining = toLedger - currentBatchStart + 1;
-      const threshold = getCatchupThreshold();
-
-      // ── Mode selection ────────────────────────────────────────────────────
-      const newMode: IndexerMode = remaining > threshold ? 'catchup' : 'steady';
-      if (newMode !== currentMode) {
-        logger.info(
-          `[reindex] mode transition: ${currentMode} -> ${newMode} ` +
-          `(remaining=${remaining}, threshold=${threshold})`,
-        );
-        currentMode = newMode;
-        _state = { ..._state, mode: currentMode };
-      }
-
-      const batchSize = currentMode === 'catchup' ? getCatchupBatchSize() : getSteadyBatchSize();
-      const batchEnd = Math.min(currentBatchStart + batchSize - 1, toLedger);
-
-      let batchEvents: Awaited<ReturnType<typeof server.getEvents>>['events'] = [];
-      try {
-        const response = await server.getEvents({
-          startLedger: currentBatchStart,
-          filters: [{ type: 'contract', contractIds: [config.registerContractId] }],
-        });
-        batchEvents = response.events.filter(
-          (e: (typeof response.events)[number]) => e.ledger >= currentBatchStart && e.ledger <= batchEnd,
-        );
-      } catch (rpcErr: unknown) {
-        if (isRateLimitError(rpcErr)) {
-          // RPC 429: back off regardless of mode, then retry the same batch.
-          const backoff = getRateLimitBackoffMs();
-          logger.warn(
-            `[reindex] rate-limited (mode=${currentMode}), backing off ${backoff}ms ` +
-            `(ledger ${currentBatchStart}-${batchEnd})`,
-          );
-          await _delay(backoff);
-          continue; // retry without advancing currentBatchStart
-        }
-        logger.warn(
-          `[reindex] RPC error on ledger batch ${currentBatchStart}-${batchEnd}: ${
-            rpcErr instanceof Error ? rpcErr.message : String(rpcErr)
-          }`,
-        );
-        // Non-rate-limit errors: continue to next batch (partial failures don't abort the job).
-      }
-
-      const rawEvents: RawIndexerEvent[] = batchEvents.map((raw: any) => ({
-        ledger: raw.ledger,
-        txHash: raw.txHash,
-        id: raw.id,
-        contractId: raw.contractId ?? config.registerContractId,
-        topic: raw.topic,
-        value: raw.value,
-        ledgerClosedAt: raw.ledgerClosedAt,
-        txIndex: raw.txIndex,
-        eventIndex: raw.eventIndex,
-      }));
-      const ordered = normalizeAndSortEvents(rawEvents, config.registerContractId);
-
-      // Insert events from this batch in a single transaction, in total order.
-      const insertBatch = db.transaction(
-        (events: typeof ordered) => {
-          let batchInserted = 0;
-          for (const event of events) {
-            const raw = event.raw as any;
-            const { type, payload } = normalizeSorobanEvent(raw);
-            const eventId = normalizeEventId(
-              event.contractId,
-              event.ledger,
-              event.txHash,
-              event.eventIndex,
-            );
-            const createdAt = raw.ledgerClosedAt
-              ? new Date(raw.ledgerClosedAt).getTime()
-              : Date.now();
-
-            const result = insert.run(
-              type,
-              event.ledger,
-              event.txHash,
-              JSON.stringify(payload),
-              createdAt,
-              event.txApplicationOrder,
-              event.eventIndex,
-              event.contractId,
-            );
-            if (result.changes === 1) {
-              batchInserted++;
-              logger.debug(`[reindex] inserted eventId=${eventId}`);
-            }
-          }
-          return batchInserted;
-        },
-      );
-
-      eventsInserted += insertBatch(ordered);
-
-      const ledgersProcessed = batchEnd - fromLedger + 1;
-      _state = {
-        ..._state,
-        ledgersProcessed,
-        eventsInserted,
-        mode: currentMode,
-      };
-
-      logger.info(
-        `[reindex] batch done ledgers=${currentBatchStart}-${batchEnd} ` +
-        `mode=${currentMode} batchSize=${batchSize} eventsInserted=${eventsInserted} total`,
-      );
-
-      currentBatchStart = batchEnd + 1;
-
-      // Throttle: steady mode waits between batches; catch-up mode has no delay.
-      const delayMs = currentMode === 'steady' ? getSteadyBatchDelay() : 0;
-      if (delayMs > 0 && currentBatchStart <= toLedger) {
-        await _delay(delayMs);
-      }
-
-      // ── Cooperative cancellation check-point ──────────────────────────────
-      // Check the cancel flag AFTER the delay so the cancellation point is
-      // well-defined: one full batch is always completed before stopping.
-      if (_cancelFlag) {
-        const cancelledAt = new Date().toISOString();
-        const lastLedger = batchEnd;
-        logger.info(
-          `[reindex] cancelled at ledger=${lastLedger} eventsInserted=${eventsInserted} admin=${adminWallet}`,
-        );
+    const result = await processEventBatches({
+      fromLedger,
+      toLedger,
+      batchSize: getSteadyBatchSize(),
+      batchDelayMs: getSteadyBatchDelay(),
+      adminWallet,
+      onProgress: (progress: BatchProcessorProgress) => {
         _state = {
           ..._state,
-          status: 'cancelled',
-          completedAt: cancelledAt,
-          lastProcessedLedger: lastLedger,
-          errorMessage: null,
+          ledgersProcessed: progress.ledgersProcessed,
+          eventsInserted: progress.eventsInserted,
+          mode: currentMode,
         };
-        logAuditEvent({
-          action: 'reindex_cancelled',
-          adminWallet: _state.cancelledBy ?? adminWallet,
-          queryParams: {
-            fromLedger,
-            toLedger,
-            lastProcessedLedger: lastLedger,
-            eventsInserted,
-          },
-          timestamp: cancelledAt,
-        }).catch(() => {});
-        return;
-      }
+      },
+      // Dynamic batch sizing based on catch-up mode
+      getBatchSize: (remainingLedgers: number) => {
+        const threshold = getCatchupThreshold();
+        const newMode: IndexerMode = remainingLedgers > threshold ? 'catchup' : 'steady';
+        if (newMode !== currentMode) {
+          logger.info(
+            `[reindex] mode transition: ${currentMode} -> ${newMode} ` +
+            `(remaining=${remainingLedgers}, threshold=${threshold})`,
+          );
+          currentMode = newMode;
+          _state = { ..._state, mode: currentMode };
+        }
+        return currentMode === 'catchup' ? getCatchupBatchSize() : getSteadyBatchSize();
+      },
+      // Dynamic delay: steady mode waits, catch-up mode has no delay
+      getBatchDelay: () => {
+        return currentMode === 'steady' ? getSteadyBatchDelay() : 0;
+      },
+      // Hook for cancellation
+      shouldCancel: () => _cancelFlag,
+      // Hook for rate-limit detection
+      isRateLimitError,
+      rateLimitBackoffMs: getRateLimitBackoffMs(),
+    });
+
+    if (result.error === 'cancelled') {
+      const cancelledAt = new Date().toISOString();
+      // The last processed ledger is derived from ledgersProcessed
+      const lastLedger = fromLedger + result.ledgersProcessed - 1;
+      logger.info(
+        `[reindex] cancelled at ledger=${lastLedger} eventsInserted=${result.eventsInserted} admin=${adminWallet}`,
+      );
+      _state = {
+        ..._state,
+        status: 'cancelled',
+        completedAt: cancelledAt,
+        lastProcessedLedger: lastLedger,
+        errorMessage: null,
+      };
+      logAuditEvent({
+        action: 'reindex_cancelled',
+        adminWallet: _state.cancelledBy ?? adminWallet,
+        queryParams: {
+          fromLedger,
+          toLedger,
+          lastProcessedLedger: lastLedger,
+          eventsInserted: result.eventsInserted,
+        },
+        timestamp: cancelledAt,
+      }).catch(() => {});
+      return;
+    }
+
+    if (result.error) {
+      throw new Error(result.error);
     }
 
     // Update the indexer's last_ledger so the normal poll loop resumes from
@@ -397,7 +306,8 @@ async function _runReindex(
     _state = {
       ..._state,
       status: 'complete',
-      ledgersProcessed: _state.ledgersTotal,
+      ledgersProcessed: result.ledgersProcessed,
+      eventsInserted: result.eventsInserted,
       completedAt,
       errorMessage: null,
     };
@@ -405,12 +315,12 @@ async function _runReindex(
     logAuditEvent({
       action: 'reindex_completed',
       adminWallet,
-      queryParams: { fromLedger, toLedger, eventsInserted },
+      queryParams: { fromLedger, toLedger, eventsInserted: result.eventsInserted },
       timestamp: completedAt,
     }).catch(() => {});
 
     logger.info(
-      `[reindex] completed fromLedger=${fromLedger} toLedger=${toLedger} eventsInserted=${eventsInserted}`,
+      `[reindex] completed fromLedger=${fromLedger} toLedger=${toLedger} eventsInserted=${result.eventsInserted}`,
     );
   } catch (err: unknown) {
     const errorMessage = err instanceof Error ? err.message : String(err);
@@ -430,12 +340,6 @@ async function _runReindex(
 
     logger.error(`[reindex] failed: ${errorMessage}`);
   }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-function _delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────

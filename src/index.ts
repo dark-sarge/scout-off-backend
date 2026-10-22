@@ -22,7 +22,11 @@ import {
 import { closeRedisClients } from "./services/redis";
 import { runTierDivergenceCheck } from "./services/tierDivergenceJob";
 import { getTierDivergenceTotal } from "./services/tierDivergenceJob";
-import { setTierDivergenceGetter } from "./middleware/metrics";
+import {
+  setTierDivergenceGetter,
+  initEventLoopMonitoring,
+  initGcMonitoring,
+} from "./middleware/metrics";
 import { drainAllSessions, setAcceptingSseSessions } from "./routes/events";
 import http from "http";
 
@@ -31,6 +35,10 @@ async function start() {
   // Register the tier-divergence counter getter so the metrics endpoint can
   // expose scout_off_tier_divergence_total without a circular import (#1132).
   setTierDivergenceGetter(getTierDivergenceTotal);
+
+  // Initialize runtime metrics monitoring (event-loop lag, GC).
+  initEventLoopMonitoring();
+  initGcMonitoring();
 
   try {
     await initDb();

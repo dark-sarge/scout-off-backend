@@ -29,6 +29,30 @@ import {
 import { withRestoredCorrelation } from './txCorrelation';
 import { EventBroadcaster, broadcaster } from './eventBroadcaster';
 
+/**
+ * Returns the list of contract IDs to fetch events from.
+ * This is shared between the live indexer, reindex, and replay to ensure
+ * they all process the same set of contracts.
+ *
+ * The list includes all five contract IDs with deduplication:
+ *   - contractId (legacy monolith)
+ *   - registerContractId
+ *   - progressContractId
+ *   - subscriptionContractId
+ *   - connectionContractId
+ *
+ * Empty contract IDs are filtered out.
+ */
+export function getIndexedContractIds(): string[] {
+  return [
+    config.contractId,
+    config.registerContractId,
+    config.progressContractId,
+    config.subscriptionContractId,
+    config.connectionContractId,
+  ].filter((id, i, arr) => Boolean(id) && arr.indexOf(id) === i);
+}
+
 const tracer = trace.getTracer('scout-off-backend');
 
 // Lazy import cache service to avoid circular dependency
@@ -224,13 +248,7 @@ export async function indexEvents(): Promise<void> {
   const fromLedger = Math.max(0, lastIndexed > margin ? lastIndexed - margin : 0);
   span.setAttribute('indexer.ledger_start', fromLedger);
 
-  const contractIds = [
-    config.contractId,
-    config.registerContractId,
-    config.progressContractId,
-    config.subscriptionContractId,
-    config.connectionContractId,
-  ].filter((id, i, arr) => Boolean(id) && arr.indexOf(id) === i);
+  const contractIds = getIndexedContractIds();
 
   const response = await server.getEvents({
     startLedger: fromLedger > 0 ? fromLedger : 1,

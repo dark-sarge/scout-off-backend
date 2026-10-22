@@ -22,6 +22,7 @@ import { createPersistedOperationsPlugin } from './graphql/persisted-operations'
 import { loadPersistedOperationsFromFile } from './graphql/persisted-operations';
 import { ErrorCode } from './utils/errorCodes';
 import { metricsMiddleware, createMetricsHandler } from './middleware/metrics';
+import { metricsGuard } from './middleware/metricsGuard';
 import { ipReputationMiddleware } from './middleware/ipReputation';
 import { createTimeout, requestTimeout } from './middleware/timeout';
 import { indexerLedgerLag } from './services/indexer';
@@ -410,10 +411,9 @@ app.get(
   getHealthDependencies,
 );
 
-// Prometheus scrape endpoint. Intentionally unauthenticated and not rate-limited
-// (standard scrape pattern): it is registered before the auth routes and is not
-// wrapped by any auth or rate-limit middleware.
-app.get('/metrics', createMetricsHandler(() => indexerLedgerLag));
+// Prometheus scrape endpoint. Protected by optional bearer token and/or CIDR allowlist.
+// Intentionally not rate-limited (standard scrape pattern).
+app.get('/metrics', metricsGuard, createMetricsHandler(() => indexerLedgerLag));
 
 app.use('/auth', authRoutes);
 

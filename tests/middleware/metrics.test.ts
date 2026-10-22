@@ -1,5 +1,16 @@
 import { Request, Response, NextFunction } from 'express';
-import { metricsMiddleware, metricsStore, errorCountsStore, getMetrics, getErrorMetrics, isMetricsEnabled } from '../../src/middleware/metrics';
+import {
+  metricsMiddleware,
+  metricsStore,
+  errorCountsStore,
+  getMetrics,
+  getErrorMetrics,
+  isMetricsEnabled,
+  isLegacyMsMetricEnabled,
+  getHttpSecondsHistogram,
+  getLatencyHistogram,
+  resetMetrics,
+} from '../../src/middleware/metrics';
 
 function makeReqRes(path = '/test', method = 'GET', statusCode = 200) {
   const listeners: Record<string, () => void> = {};
@@ -18,6 +29,8 @@ beforeEach(() => {
   errorCountsStore['4xx'] = 0;
   errorCountsStore['5xx'] = 0;
   delete process.env.METRICS_ENABLED;
+  delete process.env.METRICS_LEGACY_MS;
+  resetMetrics();
 });
 
 describe('metricsMiddleware', () => {
@@ -202,5 +215,45 @@ describe('metricsMiddleware — unmatched route bucketing', () => {
     }
     // Each distinct matched route gets its own key
     expect(Object.keys(metricsStore)).toHaveLength(3);
+  });
+});
+
+// ─── HTTP request duration seconds histogram ─────────────────────────────────
+
+describe('http_request_duration_seconds histogram', () => {
+  it('records latency in seconds', () => {
+    const { req, res, next, emit } = makeReqRes('/api/test');
+    metricsMiddleware(req, res, next);
+    emit('finish');
+
+    const hist = getHttpSecondsHistogram();
+    expect(hist.count).toBe(1);
+    expect(hist.sum).toBeGreaterThan(0);
+  });
+
+  it('accumulates latency across multiple requests', () => {
+    for (let i = 0; i < 5; i++) {
+      const { req, res, next, emit } = makeReqRes('/api/test');
+      metricsMiddleware(req, res, next);
+      emit('finish');
+    }
+
+    const hist = getHttpSecondsHistogram();
+    expect(hist.count).toBe(5);
+    expect(hist.sum).toBeGreaterThan(0);
+  });
+});
+
+// ─── Legacy metric toggle ─────────────────────────────────────────────────────
+
+describe('isLegacyMsMetricEnabled', () => {
+  it('returns true by default', () => {
+    expect(isLegacyMsMetricEnabled()).toBe(true);
+  });
+
+  it('returns false when METRICS_LEGACY_MS=false', () => {
+    process.env.METRICS_LEGACY_MS = 'false';
+    expect(isLegacyMsMetricEnabled()).toBe(false);
+    delete process.env.METRICS_LEGACY_MS;
   });
 });

@@ -38,6 +38,7 @@ jest.mock('../../src/services/indexer', () => ({
   normalizeEventId: jest.fn(
     (_contractId: string, ledger: number, txHash: string) => `${ledger}:${txHash}`,
   ),
+  getIndexedContractIds: jest.fn(() => ['CONTRACT_A']),
 }));
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

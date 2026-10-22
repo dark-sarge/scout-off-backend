@@ -777,6 +777,27 @@ const config = {
   /** Log queries slower than this threshold (ms). */
   slowQueryThresholdMs: parseNumericEnv('SLOW_QUERY_THRESHOLD_MS', process.env.SLOW_QUERY_THRESHOLD_MS, 50, { min: 0, integer: true }),
 
+  // ── Metrics endpoint protection ────────────────────────────────────────
+  /**
+   * Optional bearer token for /metrics endpoint protection.
+   * When set, requests must include Authorization: Bearer <token>.
+   * Recommended in production to prevent unauthorized scraping of operational metrics.
+   */
+  metrics: {
+    authToken: process.env.METRICS_AUTH_TOKEN ?? '',
+    /**
+     * Optional CIDR allowlist for /metrics endpoint.
+     * Comma-separated list of IPv4 addresses or CIDR ranges (e.g., "10.0.0.0/8,192.168.1.0/24").
+     * When set, requests from outside the CIDRs are rejected with 403.
+     * Uses req.socket.remoteAddress (not X-Forwarded-For) since scrapers connect directly.
+     */
+    allowedCidrs: (() => {
+      const raw = process.env.METRICS_ALLOWED_CIDRS;
+      if (!raw || raw.trim() === '') return [];
+      return raw.split(',').map((cidr) => cidr.trim()).filter(Boolean);
+    })(),
+  },
+
   // ── Circuit breakers ──────────────────────────────────────────────────
   // Default circuit breaker thresholds for generic outbound calls (Stellar RPC, etc.).
   circuitBreaker: {
@@ -851,6 +872,19 @@ const config = {
 };
 
 export default config;
+
+// ── Metrics protection warning ────────────────────────────────────────────
+//
+// Warn at startup if /metrics is exposed without protection in production.
+if (nodeEnv === 'production' || nodeEnv === 'staging') {
+  if (!config.metrics.authToken && config.metrics.allowedCidrs.length === 0) {
+    console.warn(
+      '[config] WARNING: /metrics endpoint is exposed without protection (METRICS_AUTH_TOKEN or METRICS_ALLOWED_CIDRS not set). ' +
+      'This exposes operational and business signals to any internet client. ' +
+      'Set METRICS_AUTH_TOKEN or METRICS_ALLOWED_CIDRS to restrict access.',
+    );
+  }
+}
 
 export function isProduction(): boolean { return config.nodeEnv === 'production'; }
 export function isStaging(): boolean { return config.nodeEnv === 'staging'; }

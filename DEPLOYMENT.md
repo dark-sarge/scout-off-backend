@@ -109,6 +109,75 @@ The sandbox can be started with `scripts/soroban-sandbox` (see [scripts/soroban-
 | `CIRCUIT_BREAKER_RESET_TIMEOUT_MS` | — | Cooldown duration before generic circuit breaker half-opens to test recovery, in ms (default: `30000` = 30 s). See [docs/degradation-contracts.md](docs/degradation-contracts.md#circuit-breakers). |
 | `IPFS_BREAKER_FAILURE_THRESHOLD` | — | Number of consecutive failures before Pinata IPFS circuit breaker opens (default: `5`). See [docs/degradation-contracts.md](docs/degradation-contracts.md#ipfs--pinata-circuit-breaker). |
 | `IPFS_BREAKER_RESET_TIMEOUT_MS` | — | Cooldown duration before Pinata IPFS circuit breaker half-opens to test recovery, in ms (default: `30000` = 30 s). See [docs/degradation-contracts.md](docs/degradation-contracts.md#ipfs--pinata-circuit-breaker). |
+| `METRICS_ENABLED` | — | Enable or disable metrics collection (default: `true`). Set to `false` to disable. |
+| `METRICS_AUTH_TOKEN` | — | Optional bearer token for `/metrics` endpoint protection. When set, requests must include `Authorization: Bearer <token>`. Recommended in production to prevent unauthorized scraping of operational and business signals. |
+| `METRICS_ALLOWED_CIDRS` | — | Optional CIDR allowlist for `/metrics` endpoint. Comma-separated list of IPv4 addresses or CIDR ranges (e.g., `10.0.0.0/8,192.168.1.0/24`). When set, requests from outside the CIDRs are rejected with 403. Uses `req.socket.remoteAddress` (not `X-Forwarded-For`) since Prometheus scrapers connect directly. |
+
+## Metrics Endpoint Protection
+
+The `/metrics` endpoint exposes operational and business signals (request counts, latencies, webhook dead-letter depth, indexer lag, tier divergence, etc.). In production, this endpoint should be protected to prevent unauthorized internet clients from scraping sensitive information.
+
+### Protection Options
+
+You can protect `/metrics` using one or both of:
+
+1. **Bearer Token** (`METRICS_AUTH_TOKEN`): Require `Authorization: Bearer <token>` header
+2. **CIDR Allowlist** (`METRICS_ALLOWED_CIDRS`): Restrict access to specific IP ranges
+
+### Configuration
+
+Add to your `.env` or Helm values:
+
+```bash
+# Option 1: Bearer token only
+METRICS_AUTH_TOKEN=your-secret-token-here
+
+# Option 2: CIDR allowlist only
+METRICS_ALLOWED_CIDRS=10.0.0.0/8,192.168.1.0/24
+
+# Option 3: Both (token AND IP must be valid)
+METRICS_AUTH_TOKEN=your-secret-token-here
+METRICS_ALLOWED_CIDRS=10.0.0.0/8
+```
+
+### Kubernetes/Helm
+
+Add to your `scout-off-secrets` Secret:
+
+```bash
+kubectl create secret generic scout-off-secrets \
+  ... \
+  --from-literal=METRICS_AUTH_TOKEN=your-secret-token \
+  --namespace <your-namespace>
+```
+
+Or configure CIDR allowlist in Helm values:
+
+```yaml
+env:
+  METRICS_ALLOWED_CIDRS: "10.0.0.0/8,192.168.1.0/24"
+```
+
+### Ingress Exclusion (Recommended)
+
+Consider excluding `/metrics` from public ingress to reduce attack surface. Set `ingress.excludeMetrics: true` in Helm values:
+
+```yaml
+ingress:
+  enabled: true
+  excludeMetrics: true
+  # ... other ingress config
+```
+
+With ingress exclusion, Prometheus should use a `ServiceMonitor` with direct pod access (node port, port-forward) or a separate internal ingress for scraping.
+
+### Startup Warning
+
+In production and staging, if neither `METRICS_AUTH_TOKEN` nor `METRICS_ALLOWED_CIDRS` is configured, the server logs a warning at startup:
+
+```
+[config] WARNING: /metrics endpoint is exposed without protection (METRICS_AUTH_TOKEN or METRICS_ALLOWED_CIDRS not set). This exposes operational and business signals to any internet client. Set METRICS_AUTH_TOKEN or METRICS_ALLOWED_CIDRS to restrict access.
+```
 
 ---
 

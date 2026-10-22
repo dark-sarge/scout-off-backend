@@ -136,11 +136,15 @@ networkPolicy:
 # -----------------------------------------------------------------------------
 ingress:
   enabled: false
-  # Ingress class name (e.g. "nginx", "traefik", "alb").
+  # Ingress class name (e.g., "nginx", "traefik", "alb").
   className: "nginx"
   annotations: {}
   #  kubernetes.io/ingress.class: nginx
   #  cert-manager.io/cluster-issuer: letsencrypt-prod
+  # Exclude /metrics from ingress (recommended when metrics are unprotected)
+  # When true, Prometheus scrapes should go through a ServiceMonitor or
+  # direct pod access (node port, port-forward) rather than public ingress.
+  excludeMetrics: false
   hosts:
     - host: api.scoutoff.io
       paths:
@@ -284,6 +288,12 @@ env:
   ADMIN_ACTION_TTL_MS: "3600000"
   # Player cache TTL in ms. Default: 60000 (1 min).
   PLAYER_CACHE_TTL_MS: "60000"
+  # Metrics endpoint protection (recommended in production)
+  # METRICS_AUTH_TOKEN: bearer token for /metrics endpoint
+  # METRICS_ALLOWED_CIDRS: comma-separated CIDR list (e.g., "10.0.0.0/8,192.168.1.0/24")
+  # Set either or both to restrict access. If neither is set, /metrics is open (warning logged in production).
+  METRICS_AUTH_TOKEN: ""
+  METRICS_ALLOWED_CIDRS: ""
 
 # -----------------------------------------------------------------------------
 # Pod annotations

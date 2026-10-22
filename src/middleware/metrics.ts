@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { ipReputationCounters, resetIpReputationCounters } from '../services/ipReputation';
+import { performance } from 'perf_hooks';
 
 // ── Tier divergence counter injection (#1132) ──────────────────────────────────
 //
@@ -38,6 +39,11 @@ export function isMetricsEnabled(): boolean {
   return process.env.METRICS_ENABLED !== 'false';
 }
 
+/** Whether legacy http_request_duration_ms metric is exported. Default true for one release. */
+export function isLegacyMsMetricEnabled(): boolean {
+  return process.env.METRICS_LEGACY_MS !== 'false';
+}
+
 /**
  * Express middleware that increments per-route request counts, accumulates latency,
  * and tracks http_errors_total for 4xx and 5xx responses.
@@ -70,6 +76,7 @@ export function metricsMiddleware(req: Request, res: Response, next: NextFunctio
     metricsStore[key].count += 1;
     metricsStore[key].totalLatencyMs += latency;
     observeLatency(latency);
+    observeHttpLatencySeconds(latency / 1000);
 
     const status = res.statusCode;
     if (status >= 400 && status < 500) {
@@ -124,6 +131,42 @@ export function getLatencyHistogram(): LatencyHistogram {
     bucketCounts: [...latencyHistogram.bucketCounts],
     sum: latencyHistogram.sum,
     count: latencyHistogram.count,
+  };
+}
+
+// ─── Seconds histogram buckets for HTTP requests (0.005 to 10s) ───────────────
+//
+// Standard Prometheus histogram for HTTP latency uses seconds with buckets
+// suited to API latency: 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s
+export const HTTP_SECONDS_BUCKETS: ReadonlyArray<number> = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
+
+export interface HttpSecondsHistogram {
+  bucketCounts: number[];
+  sum: number;
+  count: number;
+}
+
+export const httpSecondsHistogram: HttpSecondsHistogram = {
+  bucketCounts: HTTP_SECONDS_BUCKETS.map(() => 0),
+  sum: 0,
+  count: 0,
+};
+
+/** Records a single request latency in seconds into the cumulative histogram. */
+function observeHttpLatencySeconds(latencySeconds: number): void {
+  for (let i = 0; i < HTTP_SECONDS_BUCKETS.length; i++) {
+    if (latencySeconds <= HTTP_SECONDS_BUCKETS[i]) httpSecondsHistogram.bucketCounts[i] += 1;
+  }
+  httpSecondsHistogram.sum += latencySeconds;
+  httpSecondsHistogram.count += 1;
+}
+
+/** Returns a snapshot of the HTTP seconds histogram. */
+export function getHttpSecondsHistogram(): HttpSecondsHistogram {
+  return {
+    bucketCounts: [...httpSecondsHistogram.bucketCounts],
+    sum: httpSecondsHistogram.sum,
+    count: httpSecondsHistogram.count,
   };
 }
 
@@ -341,12 +384,16 @@ export function resetMetrics(): void {
   latencyHistogram.bucketCounts = LATENCY_BUCKETS_MS.map(() => 0);
   latencyHistogram.sum = 0;
   latencyHistogram.count = 0;
+  httpSecondsHistogram.bucketCounts = HTTP_SECONDS_BUCKETS.map(() => 0);
+  httpSecondsHistogram.sum = 0;
+  httpSecondsHistogram.count = 0;
   cacheCountsStore.hits = 0;
   cacheCountsStore.misses = 0;
   cacheCountsStore.evictions = 0;
   cacheInvalidationStore.total = 0;
   stuckPendingPinsCount = 0;
   resetIpReputationCounters();
+  resetRuntimeMetrics();
 }
 
 // ─── Cache hit / miss / eviction counters ─────────────────────────────────────
@@ -429,6 +476,125 @@ export function getFeeWithdrawalDbWriteFailuresTotal(): number {
   return feeWithdrawalDbWriteFailuresStore.total;
 }
 
+// ─── Runtime metrics (process CPU, RSS, heap, event-loop lag, GC, handles) ────
+
+/**
+ * Event-loop lag monitor. Uses perf_hooks.monitorEventLoopDelay to measure
+ * how long the event loop is blocked. Started at module load if metrics enabled.
+ */
+let eventLoopDelayMonitor: performance.EventLoopDelayMonitor | null = null;
+
+/** Initialize event-loop lag monitoring. Called at startup. */
+export function initEventLoopMonitoring(): void {
+  if (!isMetricsEnabled()) return;
+  try {
+    eventLoopDelayMonitor = new performance.EventLoopDelayMonitor({
+      resolution: 10, // 10ms resolution
+    });
+    eventLoopDelayMonitor.enable();
+  } catch (err) {
+    // monitorEventLoopDelayMonitor may not be available in all Node versions
+    console.warn('[metrics] Failed to initialize event-loop monitoring:', err);
+  }
+}
+
+/** Get current event-loop lag in seconds (95th percentile over the sampling window). */
+export function getEventLoopLagSeconds(): number {
+  if (!eventLoopDelayMonitor) return 0;
+  const delays = eventLoopDelayMonitor;
+  if (delays.length === 0) return 0;
+  // Calculate 95th percentile
+  const sorted = Array.from(delays).sort((a, b) => a - b);
+  const p95Index = Math.floor(sorted.length * 0.95);
+  return sorted[p95Index]! / 1000; // Convert to seconds
+}
+
+/** GC duration histogram buckets (in seconds). */
+export const GC_DURATION_BUCKETS: ReadonlyArray<number> = [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1];
+
+interface GcHistogram {
+  bucketCounts: number[];
+  sum: number;
+  count: number;
+}
+
+const gcHistogram: GcHistogram = {
+  bucketCounts: GC_DURATION_BUCKETS.map(() => 0),
+  sum: 0,
+  count: 0,
+};
+
+/** GC performance observer. Initialized at startup if metrics enabled. */
+let gcObserver: PerformanceObserver | null = null;
+
+/** Initialize GC performance observer. Called at startup. */
+export function initGcMonitoring(): void {
+  if (!isMetricsEnabled()) return;
+  try {
+    gcObserver = new PerformanceObserver((list) => {
+      const entries = list.getEntries();
+      for (const entry of entries) {
+        if (entry.name === 'gc') {
+          const duration = entry.duration / 1000; // Convert to seconds
+          for (let i = 0; i < GC_DURATION_BUCKETS.length; i++) {
+            if (duration <= GC_DURATION_BUCKETS[i]) gcHistogram.bucketCounts[i] += 1;
+          }
+          gcHistogram.sum += duration;
+          gcHistogram.count += 1;
+        }
+      }
+    });
+    gcObserver.observe({ entryTypes: ['gc'] });
+  } catch (err) {
+    // GC observation may not be available in all Node versions
+    console.warn('[metrics] Failed to initialize GC monitoring:', err);
+  }
+}
+
+/** Get GC histogram snapshot. */
+export function getGcHistogram(): GcHistogram {
+  return {
+    bucketCounts: [...gcHistogram.bucketCounts],
+    sum: gcHistogram.sum,
+    count: gcHistogram.count,
+  };
+}
+
+/** Get process CPU seconds total (user + system). */
+export function getProcessCpuSecondsTotal(): number {
+  const usage = process.cpuUsage();
+  return (usage.user + usage.system) / 1e6; // Convert microseconds to seconds
+}
+
+/** Get process resident memory in bytes. */
+export function getProcessResidentMemoryBytes(): number {
+  return process.memoryUsage().rss;
+}
+
+/** Get Node.js heap size used in bytes. */
+export function getHeapSizeUsedBytes(): number {
+  return process.memoryUsage().heapUsed;
+}
+
+/** Get Node.js heap size total in bytes. */
+export function getHeapSizeTotalBytes(): number {
+  return process.memoryUsage().heapTotal;
+}
+
+/** Get active handles count. */
+export function getActiveHandles(): number {
+  // process._getActiveHandles() is undocumented but widely used for monitoring
+  // @ts-expect-error - accessing undocumented Node API
+  return process._getActiveHandles?.()?.length ?? 0;
+}
+
+/** Reset runtime metrics (for test isolation). */
+export function resetRuntimeMetrics(): void {
+  gcHistogram.bucketCounts = GC_DURATION_BUCKETS.map(() => 0);
+  gcHistogram.sum = 0;
+  gcHistogram.count = 0;
+}
+
 // ─── Prometheus exposition ──────────────────────────────────────────────────────
 
 /** Content-Type for the Prometheus text exposition format (v0.0.4). */
@@ -458,8 +624,10 @@ export function serializeMetrics(extras: SerializeMetricsExtras = {}): string {
   const routes = getMetrics();
   const errors = getErrorMetrics();
   const hist = getLatencyHistogram();
+  const httpSecondsHist = getHttpSecondsHistogram();
   const cache = getCacheMetrics();
   const webhook = getWebhookCounters();
+  const gcHist = getGcHistogram();
   const lines: string[] = [];
 
   // Request count (counter) — one series per route.
@@ -470,14 +638,27 @@ export function serializeMetrics(extras: SerializeMetricsExtras = {}): string {
   }
 
   // Request duration (histogram) — cumulative buckets plus _sum and _count.
-  lines.push('# HELP http_request_duration_ms Request latency in milliseconds');
-  lines.push('# TYPE http_request_duration_ms histogram');
-  for (let i = 0; i < LATENCY_BUCKETS_MS.length; i++) {
-    lines.push(`http_request_duration_ms_bucket{le="${LATENCY_BUCKETS_MS[i]}"} ${hist.bucketCounts[i]}`);
+  // NEW: http_request_duration_seconds (standard Prometheus metric)
+  lines.push('# HELP http_request_duration_seconds HTTP request latency in seconds');
+  lines.push('# TYPE http_request_duration_seconds histogram');
+  for (let i = 0; i < HTTP_SECONDS_BUCKETS.length; i++) {
+    lines.push(`http_request_duration_seconds_bucket{le="${HTTP_SECONDS_BUCKETS[i]}"} ${httpSecondsHist.bucketCounts[i]}`);
   }
-  lines.push(`http_request_duration_ms_bucket{le="+Inf"} ${hist.count}`);
-  lines.push(`http_request_duration_ms_sum ${hist.sum}`);
-  lines.push(`http_request_duration_ms_count ${hist.count}`);
+  lines.push(`http_request_duration_seconds_bucket{le="+Inf"} ${httpSecondsHist.count}`);
+  lines.push(`http_request_duration_seconds_sum ${httpSecondsHist.sum}`);
+  lines.push(`http_request_duration_seconds_count ${httpSecondsHist.count}`);
+
+  // LEGACY: http_request_duration_ms (deprecated, will be removed in next release)
+  if (isLegacyMsMetricEnabled()) {
+    lines.push('# HELP http_request_duration_ms HTTP request latency in milliseconds (DEPRECATED: use http_request_duration_seconds)');
+    lines.push('# TYPE http_request_duration_ms histogram');
+    for (let i = 0; i < LATENCY_BUCKETS_MS.length; i++) {
+      lines.push(`http_request_duration_ms_bucket{le="${LATENCY_BUCKETS_MS[i]}"} ${hist.bucketCounts[i]}`);
+    }
+    lines.push(`http_request_duration_ms_bucket{le="+Inf"} ${hist.count}`);
+    lines.push(`http_request_duration_ms_sum ${hist.sum}`);
+    lines.push(`http_request_duration_ms_count ${hist.count}`);
+  }
 
   // Error rate (counter) — labelled by status class.
   lines.push('# HELP http_errors_total Total number of HTTP error responses by status class');
@@ -603,6 +784,40 @@ export function serializeMetrics(extras: SerializeMetricsExtras = {}): string {
   lines.push('# HELP scout_off_tier_divergence_total Total number of player tier divergence events detected since process start');
   lines.push('# TYPE scout_off_tier_divergence_total counter');
   lines.push(`scout_off_tier_divergence_total ${getTierDivergenceForMetrics()}`);
+
+  // ─── Runtime metrics (process CPU, RSS, heap, event-loop lag, GC, handles) ────
+  lines.push('# HELP process_cpu_seconds_total Total user and system CPU time spent in seconds');
+  lines.push('# TYPE process_cpu_seconds_total counter');
+  lines.push(`process_cpu_seconds_total ${getProcessCpuSecondsTotal()}`);
+
+  lines.push('# HELP process_resident_memory_bytes Resident memory size in bytes');
+  lines.push('# TYPE process_resident_memory_bytes gauge');
+  lines.push(`process_resident_memory_bytes ${getProcessResidentMemoryBytes()}`);
+
+  lines.push('# HELP nodejs_heap_size_used_bytes Process heap size used in bytes');
+  lines.push('# TYPE nodejs_heap_size_used_bytes gauge');
+  lines.push(`nodejs_heap_size_used_bytes ${getHeapSizeUsedBytes()}`);
+
+  lines.push('# HELP nodejs_heap_size_total_bytes Total heap size in bytes');
+  lines.push('# TYPE nodejs_heap_size_total_bytes gauge');
+  lines.push(`nodejs_heap_size_total_bytes ${getHeapSizeTotalBytes()}`);
+
+  lines.push('# HELP nodejs_eventloop_lag_seconds Event-loop lag in seconds (95th percentile)');
+  lines.push('# TYPE nodejs_eventloop_lag_seconds gauge');
+  lines.push(`nodejs_eventloop_lag_seconds ${getEventLoopLagSeconds()}`);
+
+  lines.push('# HELP nodejs_gc_duration_seconds Garbage collection duration in seconds');
+  lines.push('# TYPE nodejs_gc_duration_seconds histogram');
+  for (let i = 0; i < GC_DURATION_BUCKETS.length; i++) {
+    lines.push(`nodejs_gc_duration_seconds_bucket{le="${GC_DURATION_BUCKETS[i]}"} ${gcHist.bucketCounts[i]}`);
+  }
+  lines.push(`nodejs_gc_duration_seconds_bucket{le="+Inf"} ${gcHist.count}`);
+  lines.push(`nodejs_gc_duration_seconds_sum ${gcHist.sum}`);
+  lines.push(`nodejs_gc_duration_seconds_count ${gcHist.count}`);
+
+  lines.push('# HELP nodejs_active_handles_total Number of active libuv handles');
+  lines.push('# TYPE nodejs_active_handles_total gauge');
+  lines.push(`nodejs_active_handles_total ${getActiveHandles()}`);
 
   return lines.join('\n') + '\n';
 }
