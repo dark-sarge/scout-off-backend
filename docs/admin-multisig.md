@@ -22,7 +22,7 @@ Each admin action is identified by a type string. The following action types are
 | `pause_contract` | Pause the main Soroban contract | `POST /api/admin/contract/pause` |
 | `unpause_contract` | Unpause the main Soroban contract | `POST /api/admin/contract/unpause` |
 | `withdraw_fees` | Withdraw accumulated platform fees | `POST /api/admin/fees` (withdraw endpoint) |
-| `update_platform_fee` | Modify the platform fee percentage | (Reserved for future fee config endpoint) |
+| `update_platform_fee` | Modify the platform fee percentage (invokes `set_platform_fee_bps` on the **subscription** contract — the single authoritative source for the fee) | `POST /api/admin/fees/config` |
 
 Additional action types may be added as new high-value operations are implemented. The enum is defined in `src/services/adminMultiSig.ts` as `AdminActionType`.
 

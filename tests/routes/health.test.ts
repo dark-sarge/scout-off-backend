@@ -258,7 +258,13 @@ describe.each(READINESS_PATHS)('%s', (path) => {
 // ─── /health ─────────────────────────────────────────────────────────────────
 
 describe('GET /health', () => {
+  const previousStellarHealthCheckEnabled = config.stellarHealthCheckEnabled;
+
   afterEach(() => {
+    (config as { stellarHealthCheckEnabled: boolean }).stellarHealthCheckEnabled =
+      previousStellarHealthCheckEnabled;
+    mockStellarHealth.mockReset();
+    mockStellarHealth.mockResolvedValue(true);
     mockGetDriver.mockReset();
     mockGetDriver.mockImplementation(getRealDriver);
   });
@@ -276,15 +282,72 @@ describe('GET /health', () => {
     expect(res.body.healthStatus.db).toBe('ok');
   });
 
-  it('reports db:error in healthStatus but still returns 200 when the DB probe fails', async () => {
-    // /health is a liveness probe — it always returns 200.
-    // A DB failure is surfaced in healthStatus.db without changing the HTTP status.
+  it('returns 503 with status degraded when the DB probe fails', async () => {
     mockGetDriver.mockImplementation(() =>
       driverWith({ get: () => Promise.reject(new Error('SQLITE_BUSY: database is locked')) }),
     );
     const res = await request(app).get('/health');
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe('degraded');
     expect(res.body.healthStatus.db).toBe('error');
+  });
+
+  it('returns 503 when the enabled Stellar probe fails', async () => {
+    (config as { stellarHealthCheckEnabled: boolean }).stellarHealthCheckEnabled = true;
+    mockStellarHealth.mockResolvedValueOnce(false);
+
+    const res = await request(app).get('/health');
+
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe('degraded');
+    expect(res.body.healthStatus.stellar).toBe('error');
+  });
+});
+
+describe('readiness DB probe timeout and latency', () => {
+  const originalTimeout = process.env.READINESS_DB_TIMEOUT_MS;
+
+  afterEach(() => {
+    if (originalTimeout === undefined) {
+      delete process.env.READINESS_DB_TIMEOUT_MS;
+    } else {
+      process.env.READINESS_DB_TIMEOUT_MS = originalTimeout;
+    }
+    mockGetDriver.mockReset();
+    mockGetDriver.mockImplementation(getRealDriver);
+    mockCheckHealth.mockReset();
+  });
+
+  it('uses the configured timeout and reports the DB probe duration', async () => {
+    process.env.READINESS_DB_TIMEOUT_MS = '30';
+    mockCheckHealth.mockResolvedValue(undefined);
+    mockGetDriver.mockImplementation(() =>
+      driverWith({ run: () => new Promise(() => {}) }),
+    );
+
+    const startedAt = Date.now();
+    const res = await request(app).get('/ready');
+
+    expect(res.status).toBe(503);
+    expectProbeStatus(res.body.services.db, 'unavailable');
+    expect(res.body.services.db.ms).toBeGreaterThanOrEqual(20);
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
+  it('falls back to the default timeout for an invalid setting', async () => {
+    process.env.READINESS_DB_TIMEOUT_MS = 'not-a-number';
+    mockCheckHealth.mockResolvedValue(undefined);
+    mockGetDriver.mockImplementation(() =>
+      driverWith({
+        run: () => new Promise((resolve) => setTimeout(() => resolve({ changes: 1, lastId: 0 }), 30)),
+      }),
+    );
+
+    const res = await request(app).get('/ready');
+
+    expect(res.status).toBe(200);
+    expectProbeStatus(res.body.services.db, 'ok');
+    expect(res.body.services.db.ms).toBeGreaterThanOrEqual(20);
   });
 });
 

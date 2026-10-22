@@ -18,6 +18,15 @@ const SECRET = process.env.JWT_SECRET ?? 'test-secret';
 
 jest.mock('../../src/db', () => ({
   queryEvents: jest.fn(),
+  // Derived from the queryEvents mock so each test configures events once;
+  // mirrors the real COUNT(*) query's createdAfter cut-off.
+  getEventsCount: jest.fn((type: string, filters?: { createdAfter?: number }) => {
+    const { queryEvents: mockedQueryEvents } = jest.requireMock('../../src/db');
+    const events = (mockedQueryEvents(type, filters) ?? []) as Array<{ created_at: number }>;
+    return events.filter(
+      (e) => filters?.createdAfter === undefined || e.created_at >= filters.createdAfter,
+    ).length;
+  }),
   getPendingMilestones: jest.fn(),
   getValidatorStats: jest.fn(),
   // Required by other parts of validatorController
@@ -284,10 +293,21 @@ describe('GET /api/validators/:wallet/stats — response shape', () => {
       payload: { validator_wallet: OTHER_VALIDATOR, player_id: 'player-X', milestone_id: 'ms-X' },
     };
 
-    mockQueryEvents.mockImplementation((type: string) => {
-      if (type === 'milestone_approved') return [recentApprovedEvent, otherWalletEvent];
-      return [];
-    });
+    // Wallet scoping happens in SQL via payloadAnyOf, so the mock applies it too.
+    mockQueryEvents.mockImplementation(
+      (type: string, filters?: { payloadAnyOf?: Array<Record<string, string>> }) => {
+        if (type !== 'milestone_approved') return [];
+        return [recentApprovedEvent, otherWalletEvent].filter(
+          (e) =>
+            !filters?.payloadAnyOf ||
+            filters.payloadAnyOf.some((cond) =>
+              Object.entries(cond).every(
+                ([k, v]) => (e.payload as Record<string, string>)[k] === v,
+              ),
+            ),
+        );
+      },
+    );
 
     const token = makeToken(VALIDATOR_WALLET, 'validator');
     const res = await request(app)

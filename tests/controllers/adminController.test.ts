@@ -197,11 +197,11 @@ describe('Admin Controller - Time-series Stats', () => {
     });
 
     it('should return basic stats when no window or breakdown requested (backward compatible)', async () => {
-      jest.spyOn(db, 'queryEvents').mockImplementation((type?: string) => {
-        if (type === 'player_registered') return [{}, {}, {}] as any;
-        if (type === 'milestone_approved') return [{}, {}] as any;
-        if (type === 'scout_subscribed') return [{}] as any;
-        return [{}, {}, {}, {}, {}] as any;
+      jest.spyOn(db, 'getEventsCount').mockImplementation((type?: string) => {
+        if (type === 'player_registered') return 3;
+        if (type === 'milestone_approved') return 2;
+        if (type === 'scout_subscribed') return 1;
+        return 5;
       });
 
       const req = { query: {} } as any;

@@ -34,7 +34,9 @@ export async function getActiveSubscription(scoutWallet: string): Promise<Active
   }
 
   // Step 2 — indexed events fallback
-  const subs = queryEvents('scout_subscribed').filter((e) => e.payload.scout === scoutWallet);
+  const subs = queryEvents('scout_subscribed', {
+    payloadFilter: { scout: scoutWallet },
+  });
   const latest = subs.at(-1);
   if (!latest) {
     return { active: false, tier: null, expiresAt: null };

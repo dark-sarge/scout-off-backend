@@ -1,13 +1,12 @@
 #![no_std]
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, Symbol,
-    token::Client as TokenClient,
-};
 use scout_off_shared::{
     errors::Error,
     events::{emit_contact_unlocked, emit_scout_subscribed},
     storage::{bump_instance, is_initialized, is_paused, set_initialized},
+};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, token::Client as TokenClient, Address, Env, Symbol,
 };
 
 // ---------------------------------------------------------------------------
@@ -84,7 +83,11 @@ impl SubscriptionContract {
     /// fee = BASE_FEE * tier_multiplier * duration_days
     /// Uses checked arithmetic to prevent overflow (Error::Overflow on failure).
     fn calculate_subscription_fee(tier: u32, duration_days: u32) -> Result<i128, Error> {
-        let tier_multiplier: i128 = if tier <= 1 { 1 } else { PREMIUM_TIER_MULTIPLIER };
+        let tier_multiplier: i128 = if tier <= 1 {
+            1
+        } else {
+            PREMIUM_TIER_MULTIPLIER
+        };
         let duration = duration_days as i128;
 
         BASE_FEE_STROOPS
@@ -181,14 +184,11 @@ impl SubscriptionContract {
 
     /// Return true if the scout has an active (non-expired) subscription.
     pub fn is_subscribed(env: Env, scout: Address) -> bool {
-        let record: SubscriptionRecord = match env
-            .storage()
-            .instance()
-            .get(&DataKey::Subscription(scout))
-        {
-            Some(r) => r,
-            None => return false,
-        };
+        let record: SubscriptionRecord =
+            match env.storage().instance().get(&DataKey::Subscription(scout)) {
+                Some(r) => r,
+                None => return false,
+            };
         env.ledger().sequence() < record.expires_at
     }
 
@@ -338,11 +338,35 @@ impl SubscriptionContract {
     }
 
     /// Update the platform fee in basis points. Only the admin may call this.
-    pub fn set_platform_fee_bps(env: Env, admin: Address, platform_fee_bps: u32) -> Result<(), Error> {
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `admin` - The caller's address (must be the stored admin and must authorize).
+    /// * `platform_fee_bps` - New fee in basis points. Valid range: 0–10000.
+    ///
+    /// # Errors
+    /// * [`Error::NotInitialized`] — Contract has not been initialized.
+    /// * [`Error::InvalidInput`] — `platform_fee_bps` exceeds 10000.
+    /// * [`Error::Unauthorized`] — Caller is not the stored admin.
+    pub fn set_platform_fee_bps(
+        env: Env,
+        admin: Address,
+        platform_fee_bps: u32,
+    ) -> Result<(), Error> {
         if !is_initialized(&env) {
             return Err(Error::NotInitialized);
         }
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if is_paused(&env) {
+            return Err(Error::ContractPaused);
+        }
+        if platform_fee_bps > 10000 {
+            return Err(Error::InvalidInput);
+        }
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
         admin.require_auth();
         if admin != stored_admin {
             return Err(Error::Unauthorized);
@@ -350,8 +374,20 @@ impl SubscriptionContract {
         env.storage()
             .instance()
             .set(&DataKey::PlatformFeeBps, &platform_fee_bps);
+        env.events().publish(
+            (soroban_sdk::symbol_short!("fee_upd"),),
+            (platform_fee_bps,),
+        );
         bump_instance(&env);
         Ok(())
+    }
+
+    /// Return the current platform fee in basis points.
+    pub fn get_platform_fee_bps(env: Env) -> Result<u32, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PlatformFeeBps)
+            .ok_or(Error::NotInitialized)
     }
 
     // ── Pause / Unpause ────────────────────────────────────────────────────
@@ -485,7 +521,9 @@ mod tests {
 
     /// Deploy a Stellar Asset Contract (native SAC) and mint tokens to `to`.
     fn create_token<'a>(env: &'a Env, admin: &Address) -> (TokenClient<'a>, Address) {
-        let token_addr = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let token_addr = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
         let sac = StellarAssetClient::new(env, &token_addr);
         // Mint a large balance to the admin so scouts can be funded.
         sac.mint(admin, &1_000_000_000_000_000i128);
@@ -566,7 +604,9 @@ mod tests {
         fund(&env, &token, &admin, &scout, 1_000_000_000_000i128);
         client.subscribe(&scout, &1u32, &1u32);
         assert!(client.is_subscribed(&scout));
-        env.ledger().with_mut(|li| { li.sequence_number += LEDGERS_PER_DAY + 1; });
+        env.ledger().with_mut(|li| {
+            li.sequence_number += LEDGERS_PER_DAY + 1;
+        });
         assert!(!client.is_subscribed(&scout));
     }
 
@@ -742,6 +782,39 @@ mod tests {
     }
 
     #[test]
+    fn set_platform_fee_bps_rejects_out_of_range() {
+        let env = Env::default();
+        let (client, admin, token) = setup(&env);
+        client.initialize(&admin, &token, &100);
+        assert_eq!(
+            client.try_set_platform_fee_bps(&admin, &10001u32),
+            Err(Ok(Error::InvalidInput))
+        );
+    }
+
+    #[test]
+    fn set_platform_fee_bps_allows_zero_and_max() {
+        let env = Env::default();
+        let (client, admin, token) = setup(&env);
+        client.initialize(&admin, &token, &100);
+        client.set_platform_fee_bps(&admin, &0u32);
+        assert_eq!(client.get_platform_fee_bps(), 0u32);
+        client.set_platform_fee_bps(&admin, &10000u32);
+        assert_eq!(client.get_platform_fee_bps(), 10000u32);
+    }
+
+    #[test]
+    fn set_platform_fee_bps_fails_when_not_initialized() {
+        let env = Env::default();
+        let (client, admin, _token) = setup(&env);
+
+        assert_eq!(
+            client.try_set_platform_fee_bps(&admin, &250u32),
+            Err(Ok(Error::NotInitialized))
+        );
+    }
+
+    #[test]
     fn set_platform_fee_bps_fails_for_non_admin() {
         let env = Env::default();
         let (client, admin, token) = setup(&env);
@@ -824,7 +897,9 @@ mod tests {
         fund(&env, &token, &admin, &scout, 1_000_000_000_000i128);
         client.subscribe(&scout, &1u32, &1u32);
         // Advance past expiry.
-        env.ledger().with_mut(|li| { li.sequence_number += LEDGERS_PER_DAY + 10; });
+        env.ledger().with_mut(|li| {
+            li.sequence_number += LEDGERS_PER_DAY + 10;
+        });
         // Subscription is expired; cancel should return NotSubscribed.
         let result = client.try_cancel_subscription(&scout);
         assert!(result.is_err());
@@ -862,7 +937,10 @@ mod tests {
         fund(&env, &token, &admin, &scout, 1_000_000_000_000i128);
         client.subscribe(&scout, &1u32, &30u32);
         let balance = client.get_fee_balance();
-        assert!(balance > 0, "fee balance must be positive after subscription");
+        assert!(
+            balance > 0,
+            "fee balance must be positive after subscription"
+        );
     }
 
     #[test]
@@ -896,12 +974,17 @@ mod tests {
                 expected_expiry = Some(expiry);
             } else {
                 let advance_by = ((state >> 2) % 4 + 1) as u32;
-                env.ledger().with_mut(|li| { li.sequence_number += advance_by; });
+                env.ledger().with_mut(|li| {
+                    li.sequence_number += advance_by;
+                });
             }
             let active = client.is_subscribed(&scout);
-            let expected_active = expected_expiry.map_or(false, |expiry| env.ledger().sequence() < expiry);
+            let expected_active =
+                expected_expiry.map_or(false, |expiry| env.ledger().sequence() < expiry);
             assert_eq!(active, expected_active, "step {step}");
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
         }
     }
 }

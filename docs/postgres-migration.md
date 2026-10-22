@@ -20,7 +20,12 @@ The migration is reversible within a maintenance window.
 > PDB disabled). Horizontal scaling (multiple replicas or the HPA) requires
 > PostgreSQL — switch `env.DB_DRIVER` to `postgres` and provide
 > `env.DATABASE_URL` **before** scaling. The chart loudly warns in its
-> NOTES.txt output if you scale while still on SQLite. See DEPLOYMENT.md.
+> NOTES.txt output if you scale while still on SQLite. The chart mounts
+> `/data` as an `emptyDir` by default; set `dataVolume.persistentVolumeClaim`
+> to an existing claim to preserve SQLite data across pod replacement. Its
+> default NetworkPolicy allows ingress only from pods in the release namespace;
+> add external ingress-controller peers through `networkPolicy.additionalIngressFrom`.
+> See DEPLOYMENT.md.
 
 ## Prerequisites
 
@@ -39,6 +44,15 @@ Before starting the backend, configure these environment variables:
 | `DATABASE_URL` | PostgreSQL connection string | (none) | **Required when `DB_DRIVER=postgres`**. Format: `postgresql://user:password@host:5432/dbname` |
 | `DATABASE_SSL` | `true`, `no-verify`, `false` | (disabled) | TLS/SSL mode for PostgreSQL connections. See [SSL / TLS Configuration](#ssl--tls-configuration) |
 | `DATABASE_POOL_SIZE` | Integer 1–100 | `10` | Maximum concurrent connections in the pool. Only used with `DB_DRIVER=postgres` |
+| `DB_STATEMENT_TIMEOUT_MS` | Positive integer (milliseconds) | `25000` | PostgreSQL server-side limit for each statement |
+| `DB_QUERY_TIMEOUT_MS` | Positive integer (milliseconds) | `30000` | Client-side query deadline; keep at or above the statement timeout |
+| `DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS` | Positive integer (milliseconds) | `60000` | PostgreSQL server-side limit for sessions idle inside a transaction |
+
+The defaults bound normal statements before the application's 30-second request
+timeout. PostgreSQL also closes idle transaction sessions after one minute so a
+stalled transaction cannot hold a pooled connection indefinitely. For SQLite,
+`SQLITE_BUSY_TIMEOUT_MS` (default `5000`) controls only lock contention; SQLite
+queries themselves execute synchronously in the Node.js process.
 
 ### `DB_DRIVER` behavior
 

@@ -13,8 +13,10 @@
 import { Request } from 'express';
 import { createLoaders, type RequestLoaders } from './loaders';
 import { isTokenRevoked } from '../services/tokenBlocklist';
+import { resolveApiKey } from '../services/apiKeyService';
 import { logger } from '../utils/logger';
 import { tryVerifyJwt } from '../utils/jwt';
+import { touchApiKeyLastUsed } from '../db';
 
 export interface GraphQLContext {
   account: string | undefined;
@@ -43,33 +45,25 @@ async function resolveApiKeyRequest(
   const apiKeyHeader = req.headers['x-api-key'];
   if (!apiKeyHeader || typeof apiKeyHeader !== 'string') return null;
   try {
-    // Lazy require mirrors middleware/auth.ts — avoids a circular module
-    // dependency at load time.
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { resolveApiKey } = require('../controllers/apiKeyController') as {
-      resolveApiKey: (rawKey: string) => Promise<{
-        scout_wallet: string;
-        id: number;
-        scopes: string[] | null;
-      } | null>;
-    };
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { touchApiKeyLastUsed } = require('../db') as {
-      touchApiKeyLastUsed: (id: number) => Promise<void>;
-    };
     const resolved = await resolveApiKey(apiKeyHeader);
     if (!resolved) {
       logger.warn({ path: req.path, error: 'graphql: invalid or revoked API key' });
       return null;
     }
-    Promise.resolve(touchApiKeyLastUsed(resolved.id)).catch(() => { /* best-effort */ });
+    void Promise.resolve(touchApiKeyLastUsed(resolved.id)).catch((err) => {
+      logger.warn({ path: req.path, error: 'graphql: failed to update API key last-used timestamp' }, err);
+    });
     return {
       account: resolved.scout_wallet,
       role: 'scout',
       apiKeyScopes: resolved.scopes,
     };
   } catch (err) {
-    logger.warn({ path: req.path, error: 'graphql: API key auth error' }, err);
+    logger.warn({
+      path: req.path,
+      error: 'graphql: API key auth error',
+      cause: err instanceof Error ? err.message : String(err),
+    });
     return null;
   }
 }

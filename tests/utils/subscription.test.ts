@@ -126,15 +126,28 @@ describe('getActiveSubscription — indexed events fallback', () => {
   it('filters events to the provided wallet only', async () => {
     const otherWallet = 'GOTHERWALLET2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
     const expiresAt = Math.floor(Date.now() / 1000) + 86400;
-    mockGetEvents.mockReturnValue([
+    const events = [
       {
         source: 'contract',
         type: 'scout_subscribed',
         contractAddress: 'contract',
         payload: { scout: otherWallet, subscription_expiry: expiresAt, tier: 'premium' },
       },
-    ]);
+    ];
+    // Wallet filtering happens in the query via payloadFilter, so the mock
+    // applies it the way the DB would.
+    mockGetEvents.mockImplementation(
+      (_type: string, opts?: { payloadFilter?: Record<string, unknown> }) =>
+        events.filter((e) =>
+          Object.entries(opts?.payloadFilter ?? {}).every(
+            ([k, v]) => (e.payload as Record<string, unknown>)[k] === v,
+          ),
+        ),
+    );
     const result = await getActiveSubscription(WALLET);
+    expect(mockGetEvents).toHaveBeenCalledWith('scout_subscribed', {
+      payloadFilter: { scout: WALLET },
+    });
     expect(result.active).toBe(false);
     expect(result.tier).toBeNull();
   });

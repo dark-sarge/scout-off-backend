@@ -1,6 +1,8 @@
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
 import app from '../../src/app';
+import config from '../../src/config';
+import { logger } from '../../src/utils/logger';
 
 const SECRET = process.env.JWT_SECRET ?? 'test-secret';
 
@@ -131,6 +133,42 @@ describe('POST /api/players/register — role enforcement', () => {
       .send(validPayload);
     expect(res.status).toBe(201);
     expect(res.body.success).toBe(true);
+  });
+
+  it('returns success even when the registration webhook dispatch rejects', async () => {
+    const token = makeToken(PLAYER_WALLET, 'player');
+    const { dispatchEventWebhook } = require('../../src/services/webhooks') as {
+      dispatchEventWebhook: jest.Mock;
+    };
+    dispatchEventWebhook.mockRejectedValueOnce(new Error('webhook unavailable'));
+
+    const res = await request(app)
+      .post('/api/players/register')
+      .set('Authorization', `Bearer ${token}`)
+      .send(validPayload);
+
+    expect(res.status).toBe(201);
+    expect(res.body.success).toBe(true);
+  });
+});
+
+describe('POST /api/players/register — cache invalidation ordering', () => {
+  it('invalidates player-list caches only after the database write', async () => {
+    const { insertOrUpdatePlayer } = require('../../src/db');
+    const { invalidatePlayerCache } = require('../../src/services/cache');
+    insertOrUpdatePlayer.mockClear();
+    invalidatePlayerCache.mockClear();
+
+    const token = makeToken(PLAYER_WALLET, 'player');
+    const res = await request(app)
+      .post('/api/players/register')
+      .set('Authorization', `Bearer ${token}`)
+      .send(validPayload);
+
+    expect(res.status).toBe(201);
+    expect(insertOrUpdatePlayer.mock.invocationCallOrder[0]).toBeLessThan(
+      invalidatePlayerCache.mock.invocationCallOrder[0],
+    );
   });
 });
 
@@ -345,6 +383,7 @@ describe('POST /api/players/register — immediate DB write (#282)', () => {
     expect(call.region).toBe('europe');
     expect(call.metadata_uri).toBeDefined();
     expect(call.player_id).toBeDefined();
+    expect(call.on_chain_player_id).toBeNull();
   });
 
   it('returns playerId in the response body', async () => {
@@ -356,6 +395,17 @@ describe('POST /api/players/register — immediate DB write (#282)', () => {
 
     expect(res.status).toBe(201);
     expect(res.body.data.playerId).toBeDefined();
+    expect(res.body.data.onChainPlayerId).toBeNull();
+    expect(res.body.data.registrationStatus).toBe('pending');
+    expect(res.body.data.onChainRegistration).toMatchObject({
+      method: 'register_player',
+      args: {
+        wallet: PLAYER_WALLET,
+        metadataUri: validPayload.metadataUri,
+        position: 'forward',
+        region: 'europe',
+      },
+    });
   });
 });
 
@@ -451,20 +501,53 @@ describe('GET /api/players — ?fields= query parameter', () => {
   });
 });
 
-// ─── X-API-Version header ─────────────────────────────────────────────────────
+// ─── API-Version / X-API-Version headers ──────────────────────────────────────
 
-describe('X-API-Version response header', () => {
-  it('is present on GET /api/players', async () => {
+describe('API version response headers', () => {
+  it('API-Version (canonical) is present on GET /api/players', async () => {
+    const res = await request(app).get('/api/players');
+    expect(res.headers['api-version']).toBeDefined();
+    expect(res.headers['api-version']).toMatch(/^\d+$/);
+  });
+
+  it('X-API-Version (deprecated alias) is present on GET /api/players', async () => {
     const res = await request(app).get('/api/players');
     expect(res.headers['x-api-version']).toBeDefined();
     expect(res.headers['x-api-version']).toMatch(/^\d+$/);
   });
 
-  it('is present on GET /api/players/:playerId 404', async () => {
+  it('both headers carry the same value on GET /api/players', async () => {
+    const res = await request(app).get('/api/players');
+    expect(res.headers['api-version']).toBe(res.headers['x-api-version']);
+  });
+
+  it('both headers are present on GET /api/players/:playerId 404', async () => {
     const { getPlayerById } = require('../../src/db');
     (getPlayerById as jest.Mock).mockReturnValue(null);
     const res = await request(app).get('/api/players/nonexistent');
+    expect(res.headers['api-version']).toBeDefined();
     expect(res.headers['x-api-version']).toBeDefined();
+    expect(res.headers['api-version']).toBe(res.headers['x-api-version']);
+  });
+
+  it('reports header-negotiated version 2 on the API-Version response header', async () => {
+    const res = await request(app).get('/api/players').set('API-Version', '2');
+    expect(res.headers['api-version']).toBe('2');
+  });
+
+  it('warns when an unversioned API path is used in production', async () => {
+    const previousNodeEnv = config.nodeEnv;
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => {});
+    (config as { nodeEnv: string }).nodeEnv = 'production';
+    try {
+      await request(app).get('/api/players');
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Unversioned /api/ path called: GET /api/players'),
+      );
+    } finally {
+      (config as { nodeEnv: string }).nodeEnv = previousNodeEnv;
+      warnSpy.mockRestore();
+    }
   });
 });
 

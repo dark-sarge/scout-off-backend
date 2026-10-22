@@ -51,19 +51,31 @@ Send `API-Version: 2` on any unversioned `/api/` path to be routed to v2 handler
 curl -H "API-Version: 2" http://localhost:4000/api/players
 ```
 
-### `API-Version` response header
+### Response version headers
 
-Every response from an `/api/` path includes an `API-Version` response header indicating which version actually handled the request:
+Every response includes two headers that both report the version that actually handled the request:
 
+| Header | Status |
+|---|---|
+| `API-Version` | **Canonical** — use this one |
+| `X-API-Version` | **Deprecated alias** — same value; will be removed at v1 sunset |
+
+Example (v1 request):
 ```
 API-Version: 1
+X-API-Version: 1
 ```
 
-or
-
+Example (v2 request):
 ```
 API-Version: 2
+X-API-Version: 2
 ```
+
+Both headers always carry the same value. Clients should migrate from
+`X-API-Version` to `API-Version`; the alias will be removed when the v1
+sunset is scheduled. See [docs/api-versioning.md](docs/api-versioning.md)
+for the full deprecation timeline.
 
 ### Deprecation policy
 
@@ -109,6 +121,11 @@ mutating endpoints require the matching scope and return `403` with
 
 | Scope | Enforced on |
 |-------|-------------|
+| `read:players` | `GET /players` ( paginated list) |
+| `read:milestones` | `GET /players/:playerId/milestones`, `GET /validators/milestones/pending`, GraphQL milestones queries |
+| `read:subscription` | `GET /scouts/:wallet/subscription` |
+| `read:contacts` | `GET /scouts/:wallet/contacts`, `GET /scouts/:wallet/contacts/:playerId` |
+| `read:trial_offers` | `GET /scouts/:wallet/trial-offers` |
 | `write:contacts` | `POST /scouts/:wallet/contacts/:playerId/unlock` |
 | `write:subscriptions` | `POST/PUT/DELETE /scouts/:wallet/subscribe` |
 | `write:trial_offers` | `POST /scouts/:wallet/trial-offers` (and its deprecated alias `/trial-offer`); `DELETE /scouts/:wallet/trial-offers/:offerId` |
@@ -118,7 +135,6 @@ mutating endpoints require the matching scope and return `403` with
 | `write:notes` | scout-note mutations |
 | `write:saved_searches` | saved-search mutations |
 | `write:player_tokens` | `POST /players/:playerId/tokens/buy` |
-| `read:subscription` | `GET /scouts/:wallet/subscription` |
 
 REST and GraphQL share the same scope contract (`src/utils/apiKeyScopes.ts`).
 See `docs/auth.md` for the full vocabulary and legacy-compatibility rules.
@@ -131,7 +147,9 @@ Clients writing retry logic against mutating operations (`subscribe`, `unlock`, 
 
 ### Overview
 
-The backend maintains a 24-hour cache of idempotent request responses keyed by the `Idempotency-Key` header value. Repeated requests with the same key within the cache window return the exact cached response — including any error responses — without re-executing the underlying operation.
+The backend maintains a 24-hour cache of idempotent request responses keyed by the `Idempotency-Key` header value. Repeated requests with the same key within the cache window return the exact cached response — **including deterministic 2xx and 4xx responses** — without re-executing the underlying operation.
+
+**Transient 5xx responses are NOT cached.** If a request completes with a 5xx status, the pending claim is released immediately so the same key can be reused for a retry without waiting for the previous 24-hour TTL.
 
 ### How to use it
 
@@ -146,7 +164,7 @@ curl -X POST http://localhost:4000/api/scouts/GSCOUT.../subscribe \
   -d '{"tier":"premium","duration":30}'
 ```
 
-**On success or any error, replay the same key to get the same response:**
+**On success or deterministic 4xx, replay the same key to get the same response:**
 
 ```bash
 # Same key = same response, even if this is a retry
@@ -156,6 +174,26 @@ curl -X POST http://localhost:4000/api/scouts/GSCOUT.../subscribe \
   -H "Content-Type: application/json" \
   -d '{"tier":"premium","duration":30}'
 # → Returns the exact same response as the first request (cached)
+```
+
+**On transient 5xx errors, retry with the same key — it will re-execute:**
+
+```bash
+# First request → 503 Service Unavailable
+curl -X POST http://localhost:4000/api/scouts/GSCOUT.../subscribe \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000" \
+  -H "Content-Type: application/json" \
+  -d '{"tier":"premium","duration":30}'
+# → 503 { success: false, error: "Request timed out", code: "REQUEST_TIMEOUT" }
+
+# Retry with the same key re-executes the operation
+curl -X POST http://localhost:4000/api/scouts/GSCOUT.../subscribe \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000" \
+  -H "Content-Type: application/json" \
+  -d '{"tier":"premium","duration":30}'
+# → 201 { success: true, data: { transactionId: "...", ... } }
 ```
 
 ### Idempotent endpoints
@@ -183,19 +221,27 @@ A successful response is cached with its status code and body. Repeating the sam
 { "success": true, "data": { "transactionId": "abc123...", "expiresAt": 1735689600000 } }
 ```
 
-#### Error (4xx / 5xx)
+#### Deterministic error (4xx)
 
-Error responses are cached equally. Repeating the same key returns the same error:
+**Cached:** `400` (Bad Request), `401` (Unauthorized), `403` (Forbidden), `404` (Not Found), `422` (Unprocessable Entity), etc.
+
+**NOT cached (retryable):** `408` (Request Timeout), `409` (Conflict), `423` (Locked), `429` (Too Many Requests). These indicate conditions that may resolve, so a retry with the same key re-executes the operation.
 
 ```json
 { "success": false, "error": "Scout has no active on-chain subscription", "code": "NOT_SUBSCRIBED" }
 ```
 
-This is intentional — retries with the same key should never trigger a new operation, even if the initial attempt failed.
+#### Transient error (5xx)
+
+**NOT cached.** The pending claim is released immediately so the same key can be reused for a retry.
+
+```json
+{ "success": false, "error": "Internal server error", "code": "INTERNAL_ERROR" }
+```
 
 #### Fingerprint conflict (409)
 
-If the same `Idempotency-Key` is used with a **materially different request body**, the API returns `409 Conflict`:
+If the same `Idempotency-Key` is used with a **materially different request body**, the API returns `409 Conflict` with a structured error:
 
 ```bash
 # First request
@@ -208,22 +254,22 @@ curl -X POST http://localhost:4000/api/scouts/GSCOUT.../subscribe \
 curl -X POST http://localhost:4000/api/scouts/GSCOUT.../subscribe \
   -H "Idempotency-Key: same-key" \
   -d '{"tier":"basic","duration":30}'
-# → 409 Conflict { error: "Idempotency key was already used with a different request" }
+# → 409 { success: false, error: "Idempotency key was already used with a different request", code: "CONFLICT" }
 ```
 
 This prevents silent data corruption from typos or accidental parameter changes.
 
 #### In-flight duplicate (409 with wait)
 
-If a second request arrives with the same `Idempotency-Key` *while the first is still being processed*, the second request waits for the first to complete (up to 5 seconds). If the first completes within that window, the second receives the same response. If it times out:
+If a second request arrives with the same `Idempotency-Key` *while the first is still being processed*, the second request waits for the first to complete (up to 5 seconds). If the first completes within that window, the second receives the same response. If it times out or the lease expires:
 
 ```json
-{ "error": "Request already in progress for this idempotency key" }
+{ "success": false, "error": "Request already in progress for this idempotency key", "code": "IN_PROGRESS" }
 ```
 
 with HTTP status `409`.
 
-This bounds the time the second caller must wait and prevents indefinite hangs.
+**Orphaned pending claims:** If a process crashes or hangs before completing the handler, the pending claim's lease expires after **35 seconds** (request timeout + margin). A subsequent request with the same key can then claim the key and proceed instead of waiting for 24 hours.
 
 ### TTL and expiry
 
@@ -239,6 +285,8 @@ Idempotency cache entries expire after **24 hours** (configured via `IDEMPOTENCY
 # Hour 25: Repeat with same key
 # → Key has expired, treated as NEW request (no cache hit)
 ```
+
+**Lease expiry:** A pending claim that never completes (e.g., due to a crash) is automatically released after **35 seconds** (`IDEMPOTENCY_LEASE_MS`). This prevents a crashed request from blocking retries indefinitely.
 
 ### Best practices
 
@@ -258,16 +306,13 @@ Idempotency cache entries expire after **24 hours** (configured via `IDEMPOTENCY
    }
    ```
 
-2. **Treat 409 responses as unrecoverable** within a single logical operation. The key may have been used differently or a concurrent request is still in progress. Generate a new key for a new attempt:
-   ```typescript
-   if (res.status === 409) {
-     // Scenario 1: fingerprint conflict — never retry with this key
-     // Scenario 2: in-flight timeout — may retry after 5+ seconds
-     // For safety: request a new operation with a new key instead.
-   }
-   ```
+2. **Handle 409 responses appropriately:**
+   - `code: "CONFLICT"` → fingerprint mismatch; never retry with this key (use a new key for a new operation)
+   - `code: "IN_PROGRESS"` → concurrent request still pending; retry with the same key after 5+ seconds, or generate a new key for a new attempt
 
-3. **Always send the same key for all retries of the same operation**, even if errors occur. This prevents duplicate charges / subscriptions if an error response was cached.
+3. **Always send the same key for all retries of the same operation**, even if errors occur. This prevents duplicate charges / subscriptions if a deterministic 2xx or 4xx response was cached.
+
+4. **Transient 5xx errors automatically release the claim**, so you can retry with the same key immediately without waiting for any TTL or lease expiry.
 
 ### Limitations
 
@@ -297,28 +342,36 @@ curl -X GET http://localhost:4000/api/players/player-001 \
 # All logs from this request will include the correlation ID for easy filtering
 ```
 
-### `X-API-Version`
+### `API-Version` and `X-API-Version`
 
 **Type:** Integer (major version)  
 **Sent on:** Every response  
 **Purpose:** Indicate which API major version handled the request.
 
-The value is the major component of the version in `package.json` (e.g., `1` for version `1.2.3`):
+Every response carries both headers with the same value:
+
+| Header | Status |
+|---|---|
+| `API-Version` | **Canonical** — use this one |
+| `X-API-Version` | **Deprecated alias** — same value; will be removed at v1 sunset |
 
 ```
+API-Version: 1
 X-API-Version: 1
 ```
 
-Use this to detect version mismatches or version-specific behaviour in production:
+Use `API-Version` (the canonical header) to detect the served version:
 
 ```typescript
-const apiVersion = parseInt(response.headers['x-api-version'], 10);
-if (apiVersion !== expectedVersion) {
-  console.warn(`Expected API v${expectedVersion}, got v${apiVersion}`);
+const servedVersion = parseInt(response.headers['api-version'], 10);
+if (servedVersion !== expectedVersion) {
+  console.warn(`Expected API v${expectedVersion}, got v${servedVersion}`);
 }
 ```
 
-**Related:** See [API Versioning](#api-versioning) for request-side version selection via `/api/v1` or `/api/v2` URL prefixes and the `API-Version` request header.
+**Migration note:** If you are currently reading `X-API-Version`, rename it to `API-Version` — the values are identical so this is a drop-in change.
+
+**Related:** See [API Versioning](#api-versioning) and [docs/api-versioning.md](docs/api-versioning.md) for request-side version selection and the full deprecation timeline.
 
 ### `X-Response-Time`
 
@@ -910,6 +963,8 @@ All error codes used in REST and GraphQL responses are defined in `src/utils/err
 |------|------------|-------------|--------------|
 | `EXPIRED_ACTION` | 410 | A multi-sig admin action has expired and can no longer be approved | Propose the action again to create a fresh request |
 | `ACTION_EXECUTED` | 409 | A multi-sig admin action has already been executed | Check the action status; cannot re-approve completed actions |
+| `WALLET_BLOCKLISTED` | 403 | The authenticated wallet is blocklisted and may not open an SSE stream | Do not reconnect; contact support if you believe this is an error |
+| `SSE_CAPACITY` | 503 | The server has reached its SSE connection limit (`SSE_MAX_CONNECTIONS`) | Reconnect after the number of seconds given in the `Retry-After` header |
 
 ---
 

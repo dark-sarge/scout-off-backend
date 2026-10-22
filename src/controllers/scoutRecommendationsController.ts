@@ -224,7 +224,7 @@ export function scorePlayer(
  */
 function getRecentlyApprovedPlayerIds(): Set<string> {
   const windowStart = Math.floor(Date.now() / 1000) - RECENT_MILESTONE_WINDOW_SECS;
-  const events = queryEvents('milestone_approved');
+  const events = queryEvents('milestone_approved', { createdAfter: windowStart });
   const ids = new Set<string>();
   for (const ev of events) {
     const createdAt = ev.created_at ?? 0;

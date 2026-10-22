@@ -111,6 +111,24 @@ service:
   targetPort: 4000
 
 # -----------------------------------------------------------------------------
+# Network policy
+# -----------------------------------------------------------------------------
+# Restrict inbound traffic to pods in this release namespace by default.
+# Add namespaceSelector/podSelector peers for external ingress controllers
+# that need to reach the service. Egress remains unrestricted for external
+# Stellar, IPFS, Redis, and database dependencies.
+networkPolicy:
+  enabled: true
+  additionalIngressFrom: []
+# Example external ingress-controller peer:
+#  - namespaceSelector:
+#      matchLabels:
+#        kubernetes.io/metadata.name: ingress-nginx
+#    podSelector:
+#      matchLabels:
+#        app.kubernetes.io/name: ingress-nginx
+
+# -----------------------------------------------------------------------------
 # Ingress (optional)
 #
 # Set ingress.enabled=true to expose the service outside the cluster.
@@ -284,16 +302,27 @@ podSecurityContext:
   runAsNonRoot: true
   runAsUser: 1000
   fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
 
 # -----------------------------------------------------------------------------
 # Container security context
 # -----------------------------------------------------------------------------
 securityContext:
   allowPrivilegeEscalation: false
-  readOnlyRootFilesystem: false   # set true if you mount a writable volume for DB
+  readOnlyRootFilesystem: true
   capabilities:
     drop:
       - ALL
+
+# -----------------------------------------------------------------------------
+# Writable database volume
+# -----------------------------------------------------------------------------
+# The container root filesystem is read-only. Mount a per-pod emptyDir at the
+# application data path by default; use an existing PVC claim for persistence.
+dataVolume:
+  mountPath: /data
+  persistentVolumeClaim: ""
 
 # -----------------------------------------------------------------------------
 # Service account
@@ -313,15 +342,16 @@ affinity: {}
 
 # -----------------------------------------------------------------------------
 # Extra volumes / volume mounts
-# Use to mount a PersistentVolumeClaim for the SQLite database file.
+# Use dataVolume.persistentVolumeClaim for the SQLite database volume. These
+# additional mounts/volumes are for other application-specific data.
 # Example:
 #   extraVolumes:
-#     - name: data
-#       persistentVolumeClaim:
-#         claimName: scout-off-data
+#     - name: custom-config
+#       configMap:
+#         name: scout-off-config
 #   extraVolumeMounts:
-#     - name: data
-#       mountPath: /data
+#     - name: custom-config
+#       mountPath: /etc/custom-config
 # -----------------------------------------------------------------------------
 extraVolumes: []
 extraVolumeMounts: []

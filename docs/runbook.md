@@ -271,3 +271,61 @@ default 5 min) should log zero mismatches.
 | `TIER_DIVERGENCE_INTERVAL_MS` | `300000` (5 min) | How often to run the reconciliation pass |
 | `TIER_DIVERGENCE_SAMPLE_SIZE` | `100` | Max players sampled per pass |
 
+## Circuit breaker tuning
+
+The backend maintains circuit breakers to fail fast when downstream dependencies degrade:
+
+| Variable | Default | Unit | Effect |
+| -------- | ------- | ---- | ------ |
+| `CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `5` | count | Consecutive failures before generic circuit breaker trips open |
+| `CIRCUIT_BREAKER_RESET_TIMEOUT_MS` | `30000` (30 s) | ms | Cooldown duration before generic breaker tests dependency recovery |
+| `IPFS_BREAKER_FAILURE_THRESHOLD` | `5` | count | Consecutive failures before Pinata IPFS circuit breaker trips open |
+| `IPFS_BREAKER_RESET_TIMEOUT_MS` | `30000` (30 s) | ms | Cooldown duration before IPFS breaker tests Pinata recovery |
+
+When open, calls fail immediately with `CircuitBreakerOpenError` rather than consuming sockets while waiting on network timeouts. See [docs/degradation-contracts.md](degradation-contracts.md#circuit-breakers) for degradation contracts and behavior under failure.
+
+## Graceful shutdown (#1315)
+
+The server implements an ordered drain sequence on `SIGTERM`/`SIGINT`:
+
+1. Flip draining flag → `/ready` and `/health/readiness` return `503` immediately (liveness stays `200`).
+2. Optional pre-stop delay (`SHUTDOWN_PRESTOP_DELAY_MS`, default `0`) so load balancers observe the `503` before traffic stops.
+3. Stop all background schedulers (indexer poll, IPFS retry/reconcile, tier-divergence check).
+4. Await in-flight job executions (up to 60 % of `SHUTDOWN_TIMEOUT_MS`).
+5. Drain SSE sessions — sends `event: session_ended\ndata: {"reason":"server_shutdown"}` to every connected client.
+6. `server.close()` + `closeIdleConnections()` — stops accepting new HTTP connections.
+7. Close Redis, database, tracing SDK.
+8. Exit `0`.
+
+**Configuration:**
+
+| Variable | Default | Description |
+| -------- | ------- | ----------- |
+| `SHUTDOWN_TIMEOUT_MS` | `10000` | Hard limit before forced `exit(1)`. Align with Helm `terminationGracePeriodSeconds`. |
+| `SHUTDOWN_PRESTOP_DELAY_MS` | `0` | Pre-stop sleep to let load balancers drain in-flight connections before traffic stops. |
+
+**Kubernetes alignment:**
+
+Set `terminationGracePeriodSeconds` ≥ `SHUTDOWN_TIMEOUT_MS / 1000 + 5` (buffer for OS signal delivery and container runtime overhead). A `preStop` hook sleep of `SHUTDOWN_PRESTOP_DELAY_MS / 1000` seconds ensures the pod stops receiving traffic before `SIGTERM` is sent:
+
+```yaml
+lifecycle:
+  preStop:
+    exec:
+      command: ["sleep", "5"]
+terminationGracePeriodSeconds: 20
+```
+
+**Expected log sequence on clean shutdown:**
+
+```
+Received SIGTERM, starting graceful shutdown...
+[shutdown] waiting for 1 in-flight job(s)...
+[sse] draining 3 session(s) for shutdown
+HTTP server closed
+Redis connections closed
+Database connection closed
+Tracing SDK shut down
+```
+
+Exit code `0` confirms clean drain. Exit code `1` with "timed out" means a job or SSE session blocked beyond `SHUTDOWN_TIMEOUT_MS` — increase the timeout or investigate the blocking operation.

@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { DbDriver, DbTxHandle } from './driver';
+import { getMigrationFiles } from './migration-files';
 import { PostgresDriver } from './postgres-driver';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../db');
@@ -48,11 +49,7 @@ async function processMigrations(
 
   await ensureMigrationHistoryTable(driver, dryRun);
 
-  const allFiles = fs.readdirSync(MIGRATIONS_DIR).sort();
-
-  const migrationFiles = allFiles.filter(
-    (f) => f.endsWith('.sql') && !f.endsWith('.down.sql')
-  );
+  const { allFiles, upFiles: migrationFiles } = getMigrationFiles(MIGRATIONS_DIR);
 
   if (direction === 'up') {
     return processUpMigrations(driver, migrationFiles, allFiles, steps, dryRun);
@@ -306,7 +303,15 @@ async function processDownMigrations(
   return results;
 }
 
-async function getAppliedMigrations(driver: DbDriver): Promise<Map<string, number>> {
+/**
+ * The forward migrations this build ships with, in the order they are applied.
+ * A database whose applied set covers all of these is at the expected version.
+ */
+export function getExpectedSchemaVersion(): { migrations: string[] } {
+  return { migrations: getMigrationFiles(MIGRATIONS_DIR).upFiles };
+}
+
+export async function getAppliedMigrations(driver: DbDriver): Promise<Map<string, number>> {
   const result = new Map<string, number>();
 
   try {

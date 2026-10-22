@@ -39,23 +39,29 @@ Limits requests per IP address across all endpoints (except health checks).
 
 ### 2. Authentication Rate Limiter
 
-Stricter per-IP limit specifically on auth endpoints to prevent brute-force attacks.
+Auth routes use two independent limits per endpoint: a broad per-IP ceiling to
+protect the service and a stricter per-account ceiling to prevent an attacker
+from evading limits by switching IP addresses. Challenge, token, and refresh
+requests each have separate namespaces, so one step in a normal login does not
+consume another step's quota.
 
-**Namespace:** `auth`
+**Namespaces:** `auth:challenge`, `auth:token`, and `auth:refresh`
 
 **Configuration:**
 - `AUTH_RATE_LIMIT_WINDOW_MS`: Time window in milliseconds (default: `60000` = 1 minute)
-- `AUTH_RATE_LIMIT_MAX`: Max requests per window per IP (default: `5`)
+- `AUTH_RATE_LIMIT_MAX`: Max requests per account and endpoint per window (default: `5`)
+- `AUTH_RATE_LIMIT_IP_MAX`: Max requests per endpoint and IP per window (default: `60`)
 
-**Example:** Each IP can attempt auth 5 times per 60 seconds.
+**Example:** Each account can make up to 5 requests to each auth endpoint per
+minute, while a shared IP can make up to 60 requests to each endpoint.
 
 **Where applied:**
-- `POST /auth/challenge` — challenge generation
-- `POST /auth/token` — token signing
+- `GET /auth/challenge` — keyed by validated Stellar account
+- `POST /auth/token` — keyed by the source account extracted from the transaction
+- `POST /auth/refresh` — keyed by the verified refresh token's account
 
-**Use case:** Prevent brute-force attacks on challenge/token signing.
-
-**Trade-off:** Legitimate clients may hit this limit if they retry aggressively. 5 requests per minute is conservative; adjust upward if you see false positives.
+Malformed or unidentifiable auth requests still count against the per-IP
+ceiling. Account counters are shared across IPs when Redis is configured.
 
 ### 3. Wallet-Based Rate Limiter
 
@@ -72,6 +78,25 @@ Limits requests per authenticated wallet (when `req.account` is present).
 **Use case:** Prevent a single compromised key from consuming all quota.
 
 **Note:** If a wallet is compromised, the attacker can still make 60 requests per minute. Wallet revocation or rotation is the primary defense; rate limiting is an additional layer.
+
+### 4. Milestone Evidence Submission Rate Limiter
+
+Protects the validator milestone submission endpoint against evidence upload flooding and automated abuse.
+
+**Namespace:** `validator-milestone`
+
+**Configuration:**
+- `MILESTONE_RATE_WINDOW_MS`: Time window in milliseconds (default: `60000` = 1 minute)
+- `MILESTONE_RATE_MAX`: Max evidence submission requests per window per caller (default: `10`)
+
+**Example:** Each caller IP/validator can submit up to 10 milestone evidence payloads per 60 seconds.
+
+**Where applied:**
+- `POST /api/validators/milestone` (and versioned aliases `/api/v1/validators/milestone`, `/api/v2/validators/milestone`)
+
+**Use case:** Submitting milestone evidence triggers schema validation, Pinata IPFS file downloading/re-pinning, and Soroban on-chain verification. Restricting submissions per caller prevents denial-of-service and storage abuse.
+
+**Interaction with per-player rate limits:** This caller-level limiter works in tandem with the per-player rate limiter (`MILESTONE_PLAYER_RATE_WINDOW_MS` / `MILESTONE_PLAYER_RATE_MAX`, default 10 submissions per player per hour, issue #1137). A validator submitting evidence is checked against both: their own burst rate (`MILESTONE_RATE_*`) and the target player's submission limit.
 
 ## Namespacing & Isolation
 
@@ -150,11 +175,13 @@ try {
 - `RATE_LIMIT_WINDOW_MS=60000`
 - `RATE_LIMIT_MAX=60`
 - `AUTH_RATE_LIMIT_MAX=5`
+- `AUTH_RATE_LIMIT_IP_MAX=60`
 
 **Test** (`NODE_ENV=test`):
 - `RATE_LIMIT_ENABLED=true` (typically disabled in tests via middleware)
 - `RATE_LIMIT_MAX=1000` (high, to avoid test flakiness)
 - `AUTH_RATE_LIMIT_MAX=1000`
+- `AUTH_RATE_LIMIT_IP_MAX=1000`
 
 **Staging** (`NODE_ENV=staging`):
 - Same as production defaults (see below)
@@ -164,6 +191,9 @@ try {
 - `RATE_LIMIT_WINDOW_MS=60000`
 - `RATE_LIMIT_MAX=60` (1 req/sec average)
 - `AUTH_RATE_LIMIT_MAX=5`
+- `MILESTONE_RATE_WINDOW_MS=60000`
+- `MILESTONE_RATE_MAX=10`
+- `AUTH_RATE_LIMIT_IP_MAX=60`
 
 ### Adjusting Limits
 
@@ -174,13 +204,13 @@ RATE_LIMIT_MAX=200
 
 This increases the global limit to 200 requests per 60 seconds per IP. If you have a trusted partner or internal service making bulk requests, this may be necessary. Consider IP allowlisting as an alternative if available.
 
-**To tighten auth limits (more aggressive brute-force protection):**
+**To tighten per-account auth limits:**
 ```env
 AUTH_RATE_LIMIT_MAX=3
 AUTH_RATE_LIMIT_WINDOW_MS=300000  # 5-minute window instead of 1-minute
 ```
 
-This allows only 3 auth attempts per 5 minutes per IP — very strict, suitable for high-security deployments.
+This allows only 3 requests per endpoint, per account, per 5 minutes.
 
 **To disable rate limiting entirely (not recommended):**
 ```env
@@ -240,6 +270,7 @@ All other endpoints are subject to rate limiting:
 - `POST /api/auth/challenge`
 - `POST /api/auth/token`
 - `GET /api/validators`
+- `POST /api/validators/milestone` (governed by `MILESTONE_RATE_*` and `MILESTONE_PLAYER_RATE_*`)
 - `POST /api/admin/*` (high-value operations — consider stricter limits)
 - Any endpoint not explicitly exempted
 

@@ -130,6 +130,22 @@ describe('connection pool sizing', () => {
   });
 });
 
+describe('query timeouts', () => {
+  it('configures server-side statement and idle transaction limits plus a client query timeout', () => {
+    const { PostgresDriver, mockPoolConstructor } = loadWithMockedPool();
+    new PostgresDriver('postgresql://localhost/test', false, 10, {
+      statementTimeoutMs: 25000,
+      queryTimeoutMs: 30000,
+      idleInTransactionSessionTimeoutMs: 60000,
+    });
+
+    const config = mockPoolConstructor.mock.calls[0][0] as Record<string, unknown>;
+    expect(config.statement_timeout).toBe(25000);
+    expect(config.query_timeout).toBe(30000);
+    expect(config.idle_in_transaction_session_timeout).toBe(60000);
+  });
+});
+
 // ─── Type safety: all valid PostgresSslOption values compile and behave correctly ──
 
 describe('valid PostgresSslOption values', () => {

@@ -1,64 +1,38 @@
 /**
  * playerTokenController.ts
  *
- * Stub handlers for the fractionalized player-sponsorship (Player Token) feature.
+ * DB-backed stub handlers for the fractionalized player-sponsorship (Player Token) feature.
  * All endpoints are gated behind the `player_tokens` feature flag. When the flag
  * is off they return 404 so the routes are invisible to callers.
- *
- * Backing store: in-memory Maps — replaced by the Soroban `player_token` contract
- * or a DB table when the feature graduates out of scaffold stage.
+ * Purchases persist in the shared database, but do not perform an XLM transfer.
  */
 
 import type { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { isFeatureEnabled, FeatureFlags } from '../services/featureFlags';
 import { logger } from '../utils/logger';
-import { Mutex } from '../utils/concurrency';
-
-// ── In-memory stub registry ───────────────────────────────────────────────────
-// Key: playerId → Map<holderWallet, tokenBalance>
-const holderRegistry = new Map<string, Map<string, number>>();
-// Key: playerId → totalSupply
-const tokenSupply = new Map<string, number>();
-
-// ── Per-player purchase mutexes ───────────────────────────────────────────────
-// One Mutex per playerId so concurrent buy requests for the same player are
-// serialised. Requests for different players proceed independently.
-const purchaseMutexes = new Map<string, Mutex>();
-
-function getMutex(playerId: string): Mutex {
-  let mutex = purchaseMutexes.get(playerId);
-  if (!mutex) {
-    mutex = new Mutex();
-    purchaseMutexes.set(playerId, mutex);
-  }
-  return mutex;
-}
+import {
+  getPlayerTokenInventory,
+  purchasePlayerTokens,
+  resetPlayerTokenRegistry,
+  seedPlayerTokenSupply,
+} from '../db';
 
 /** Seed a player's token supply (used by integration tests). */
-export function _stubSeedTokens(playerId: string, supply: number): void {
-  tokenSupply.set(playerId, supply);
-  if (!holderRegistry.has(playerId)) {
-    holderRegistry.set(playerId, new Map());
-  }
+export async function _stubSeedTokens(playerId: string, supply: number): Promise<void> {
+  await seedPlayerTokenSupply(playerId, supply);
 }
 
 /** Reset stub state between tests. */
-export function _stubReset(): void {
-  holderRegistry.clear();
-  tokenSupply.clear();
-}
-
-/** Reset per-player mutexes between tests. */
-export function _stubResetMutexes(): void {
-  purchaseMutexes.clear();
+export async function _stubReset(): Promise<void> {
+  await resetPlayerTokenRegistry();
 }
 
 // ── Validation schemas ────────────────────────────────────────────────────────
 
 export const buyTokenSchema = z.object({
-  amount: z.number().int().min(1, 'amount must be at least 1'),
-  buyerWallet: z.string().min(1, 'buyerWallet is required'),
+  amount: z.number().int().min(1, 'amount must be at least 1').max(Number.MAX_SAFE_INTEGER),
+  buyerWallet: z.string().min(1).optional(),
 }).strict();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -79,60 +53,40 @@ function featureFlagGuard(res: Response): boolean {
 /**
  * Return the holder list and per-holder token balances for a player.
  */
-export function getPlayerTokenHolders(
+export async function getPlayerTokenHolders(
   req: Request,
   res: Response,
   next: NextFunction,
-): void {
+): Promise<void> {
   if (!featureFlagGuard(res)) return;
 
   const {playerId} = req.params as {playerId: string};
+  try {
+    const inventory = await getPlayerTokenInventory(playerId);
+    if (!inventory) {
+      res.status(404).json({ success: false, error: 'No tokens have been issued for this player.' });
+      return;
+    }
 
-  const supply = tokenSupply.get(playerId);
-  if (supply === undefined) {
-    res.status(404).json({ success: false, error: 'No tokens have been issued for this player.' });
-    return;
+    res.json({ success: true, data: { playerId, ...inventory } });
+  } catch (err) {
+    next(err);
   }
-
-  const holders = holderRegistry.get(playerId) ?? new Map<string, number>();
-  let soldTokens = 0;
-  const holderList: Array<{ holder: string; tokens: number }> = [];
-
-  for (const [holder, tokens] of holders.entries()) {
-    holderList.push({ holder, tokens });
-    soldTokens += tokens;
-  }
-
-  res.json({
-    success: true,
-    data: {
-      playerId,
-      totalSupply: supply,
-      soldTokens,
-      holders: holderList,
-    },
-  });
 }
 
 // ── POST /api/players/:playerId/tokens/buy ────────────────────────────────────
 
 /**
- * Purchase Player Tokens for a given player (stub).
+ * Purchase Player Tokens for a given player.
  *
- * The supply check and balance write are wrapped in a per-playerId Mutex so
- * that concurrent requests are serialised: only one request at a time can
- * read `remaining` and commit the updated balance for a given player. This
- * eliminates the check-then-act race that would otherwise allow overselling.
+ * Supply checks and holder-balance writes execute in one DB transaction,
+ * serialized per player by the database driver across all processes.
  *
  * If a concurrent purchase exhausts the remaining supply before this request
  * acquires the lock, the handler returns HTTP 409 (Conflict) rather than the
  * normal HTTP 400 (Bad Request) so callers can distinguish a lost-race from
  * an invalid request.
  *
- * Design note: this controller is a TypeScript-side in-memory stub. Once the
- * Soroban `player_token` contract replaces it, atomicity moves to the
- * on-chain level and this mutex becomes unnecessary. The fix is needed today
- * because the in-memory state has no inherent transactional safety.
  */
 export async function buyPlayerToken(
   req: Request,
@@ -142,6 +96,11 @@ export async function buyPlayerToken(
   if (!featureFlagGuard(res)) return;
 
   const {playerId} = req.params as {playerId: string};
+  const buyerWallet = req.account;
+  if (!buyerWallet) {
+    res.status(401).json({ success: false, error: 'Authenticated account is required.' });
+    return;
+  }
 
   const parsed = buyTokenSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -152,39 +111,29 @@ export async function buyPlayerToken(
     return;
   }
 
-  const { amount, buyerWallet } = parsed.data;
-
-  const supply = tokenSupply.get(playerId);
-  if (supply === undefined) {
-    res.status(404).json({ success: false, error: 'No tokens have been issued for this player.' });
+  const { amount } = parsed.data;
+  if (parsed.data.buyerWallet && parsed.data.buyerWallet !== buyerWallet) {
+    res.status(403).json({ success: false, error: 'buyerWallet must match the authenticated account.' });
     return;
   }
 
-  // Acquire the per-player mutex before reading remaining supply and writing
-  // the updated balance. This ensures no other concurrent request can slip
-  // between the check and the write for the same playerId.
-  await getMutex(playerId).withLock(async () => {
-    const holders = holderRegistry.get(playerId) ?? new Map<string, number>();
-    const currentSold = Array.from(holders.values()).reduce((a, b) => a + b, 0);
-    const remaining = supply - currentSold;
+  try {
+    const result = await purchasePlayerTokens(playerId, buyerWallet, amount);
+    if (result.status === 'not_found') {
+      res.status(404).json({ success: false, error: 'No tokens have been issued for this player.' });
+      return;
+    }
 
-    if (amount > remaining) {
-      // Use 409 Conflict to distinguish a lost-race (supply exhausted by a
-      // concurrent purchase) from a plain validation error (400).
+    if (result.status === 'exhausted') {
       res.status(409).json({
         success: false,
-        error: `Supply exhausted: ${remaining} token(s) remaining. Concurrent purchase may have claimed the remaining supply — try a smaller amount.`,
+        error: `Supply exhausted: ${result.remaining} token(s) remaining. Concurrent purchase may have claimed the remaining supply — try a smaller amount.`,
         code: 'TOKEN_SUPPLY_EXHAUSTED',
       });
       return;
     }
 
-    const prev = holders.get(buyerWallet) ?? 0;
-    const newBalance = prev + amount;
-    holders.set(buyerWallet, newBalance);
-    holderRegistry.set(playerId, holders);
-
-    logger.info(`[playerToken] playerId=${playerId} buyer=${buyerWallet} amount=${amount} newBalance=${newBalance}`);
+    logger.info(`[playerToken] playerId=${playerId} buyer=${buyerWallet} amount=${amount} newBalance=${result.newBalance}`);
 
     res.json({
       success: true,
@@ -192,8 +141,10 @@ export async function buyPlayerToken(
         playerId,
         buyerWallet,
         amount,
-        newBalance,
+        newBalance: result.newBalance,
       },
     });
-  });
+  } catch (err) {
+    next(err);
+  }
 }

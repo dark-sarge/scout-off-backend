@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { Keypair } from '@stellar/stellar-sdk';
 import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
-import { buildChallenge, verifyAndIssueToken, extractAccount } from '../services/sep10';
+import { buildChallenge, verifyChallenge, extractAccount } from '../services/sep10';
 import { logger } from '../utils/logger';
 import { extractClientIp } from '../utils/ipExtractor';
 import config from '../config';
@@ -99,7 +99,7 @@ try {
     const { transaction, role } = parsed.data;
 
     // Step 1: verify signatures and get the authenticated account.
-    const { account } = verifyAndIssueToken(transaction, role);
+    const { account } = verifyChallenge(transaction);
 
     // Step 2: determine the effective role from the cryptographically verified account.
     const isAdmin =
@@ -127,8 +127,21 @@ try {
         'Invalid challenge signature',
         'Missing source account in challenge',
         'Challenge has expired',
+        'Challenge source account is not the server account',
+        'Challenge sequence number must be 0',
+        'Challenge must have time bounds',
+        'Challenge minTime is in the future',
+        'Invalid challenge: no operations found',
+        'Invalid challenge: expected manageData operation',
+        'Invalid challenge: operation',
+        'Invalid challenge: wrong operation name',
+        'Invalid challenge: missing nonce value',
+        'Invalid challenge: nonce must be exactly 64 bytes',
+        'Operation',
+        'must be sourced by the server account',
+        'Challenge not signed by server',
       ];
-      if (knownAuthErrors.includes(error.message)) {
+      if (knownAuthErrors.some((msg) => error.message.includes(msg))) {
         let attemptedWallet: string | null = null;
         try { attemptedWallet = extractAccount((req.body as { transaction?: string }).transaction ?? ''); } catch { /* not extractable */ }
         logger.warn('[auth] failed_token_exchange', {
@@ -137,7 +150,11 @@ try {
           attemptedWallet,
           reason: error.message,
         });
-        res.status(401).json({ success: false, error: error.message });
+        res.status(401).json({
+          success: false,
+          error: error.message,
+          code: error.message === 'Challenge has expired' ? ErrorCode.TOKEN_EXPIRED : ErrorCode.TOKEN_INVALID,
+        });
         return;
       }
       logger.warn('[auth] failed_token_request malformed_xdr', {
@@ -179,13 +196,21 @@ try {
       payload = verifyJwt(refreshToken);
     } catch (err) {
       logger.warn('[auth] refresh_token_invalid', { reason: err instanceof Error ? err.message : String(err) });
-      res.status(401).json({ success: false, error: 'Invalid or expired refresh token' });
+      res.status(401).json({
+        success: false,
+        error: 'Invalid or expired refresh token',
+        code: err instanceof jwt.TokenExpiredError ? ErrorCode.TOKEN_EXPIRED : ErrorCode.TOKEN_INVALID,
+      });
       return;
     }
 
     // Must carry type:'refresh' to prevent access tokens being used here.
     if (payload.type !== 'refresh') {
-      res.status(401).json({ success: false, error: 'Token is not a refresh token' });
+      res.status(401).json({
+        success: false,
+        error: 'Token is not a refresh token',
+        code: ErrorCode.TOKEN_INVALID,
+      });
       return;
     }
 
@@ -194,20 +219,28 @@ try {
     const role = payload.role as string | undefined;
 
     if (!jti || !account) {
-      res.status(401).json({ success: false, error: 'Malformed refresh token' });
+      res.status(401).json({
+        success: false,
+        error: 'Malformed refresh token',
+        code: ErrorCode.TOKEN_INVALID,
+      });
       return;
     }
 
     // Check revocation blocklist.
     if (await isTokenRevoked(jti)) {
       logger.warn('[auth] refresh_token_revoked', { jti });
-      res.status(401).json({ success: false, error: 'Refresh token has been revoked' });
+      res.status(401).json({
+        success: false,
+        error: 'Refresh token has been revoked',
+        code: ErrorCode.TOKEN_INVALID,
+      });
       return;
     }
 
     // Rotate: revoke old refresh token jti immediately.
     const expiresAtSeconds = payload.exp ?? Math.floor(Date.now() / 1000) + config.jwtRefreshTtlSeconds;
-    revokeToken(jti, expiresAtSeconds);
+    await revokeToken(jti, expiresAtSeconds);
 
     // Issue new pair.
     const { token: newAccessToken, expiresAt } = issueAccessToken(account, role ?? 'player');
@@ -236,7 +269,7 @@ export const logoutSchema = z.object({
  * Revokes the caller's access token jti (from the bearer header) and,
  * if a refreshToken body param is provided, its jti too.
  */
-export function postLogout(req: Request, res: Response, next: NextFunction): void {
+export async function postLogout(req: Request, res: Response, next: NextFunction): Promise<void> {
 try {
     // The access token is already verified by requireAuth middleware.
     // We need to revoke its jti.
@@ -244,27 +277,24 @@ try {
     const rawAccessToken = header.startsWith('Bearer ') ? header.slice(7) : '';
 
     if (rawAccessToken) {
-      try {
-        const decoded = jwt.decode(rawAccessToken) as jwt.JwtPayload | null;
-        if (decoded?.jti && decoded.exp) {
-          revokeToken(decoded.jti, decoded.exp);
-        }
-      } catch {
-        // Best-effort — don't fail the logout
+      const decoded = jwt.decode(rawAccessToken) as jwt.JwtPayload | null;
+      if (decoded?.jti && decoded.exp) {
+        await revokeToken(decoded.jti, decoded.exp);
       }
     }
 
     // Optionally revoke the refresh token too.
     const parsed = logoutSchema.safeParse(req.body);
     if (parsed.success && parsed.data.refreshToken) {
+      let rtPayload: jwt.JwtPayload | undefined;
       try {
-        const rtPayload = verifyJwt(parsed.data.refreshToken);
-        if (rtPayload.jti && rtPayload.exp && rtPayload.type === 'refresh') {
-          revokeToken(rtPayload.jti, rtPayload.exp);
-        }
+        rtPayload = verifyJwt(parsed.data.refreshToken);
       } catch {
         // Invalid refresh token on logout — that's fine, just ignore it.
         logger.debug('[auth] logout: could not verify refresh token (already expired or invalid)');
+      }
+      if (rtPayload?.jti && rtPayload.exp && rtPayload.type === 'refresh') {
+        await revokeToken(rtPayload.jti, rtPayload.exp);
       }
     }
 

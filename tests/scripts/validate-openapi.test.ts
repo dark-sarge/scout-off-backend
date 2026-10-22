@@ -172,4 +172,31 @@ describe('validate-openapi script (integration)', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('fails when operations share an operationId', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'validate-openapi-'));
+    try {
+      const duplicateIdSpec = {
+        openapi: '3.0.0',
+        info: { title: 'Fixture spec', version: '1.0.0' },
+        paths: {
+          '/a': { get: { operationId: 'duplicate', responses: { 200: { description: 'OK' } } } },
+          '/b': { get: { operationId: 'duplicate', responses: { 200: { description: 'OK' } } } },
+        },
+      };
+      const yamlPath = path.join(tmpDir, 'openapi.yaml');
+      const jsonPath = path.join(tmpDir, 'openapi.json');
+      fs.writeFileSync(yamlPath, yaml.dump(duplicateIdSpec));
+      fs.writeFileSync(jsonPath, `${JSON.stringify(duplicateIdSpec, null, 2)}\n`);
+
+      const result = runValidator({
+        OPENAPI_YAML_PATH: yamlPath,
+        OPENAPI_JSON_PATH: jsonPath,
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('operationId values must be unique');
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

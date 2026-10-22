@@ -16,13 +16,17 @@
 import { createYoga, createSchema } from 'graphql-yoga';
 import { useValidationRule } from '@envelop/core';
 import { Application, Request, Response, NextFunction } from 'express';
-import { GraphQLError, Kind } from 'graphql';
+import { GraphQLError, visit } from 'graphql';
+import { optionalAuth } from '../middleware/auth';
+import { rateLimit, walletRateLimit } from '../middleware/rateLimit';
 import { isEnabled, GRAPHQL_ENABLED } from '../services/featureFlags';
 import { typeDefs } from './schema';
 import { resolvers } from './resolvers';
 import { createContext } from './context';
 import { createDepthLimitRule, createQueryCostRule, MAX_DEPTH, MAX_QUERY_COST } from './validation';
 import { logger } from '../utils/logger';
+import { createPersistedOperationsPlugin } from './persisted-operations';
+import config from '../config';
 
 // ─── Production introspection-blocking plugin ────────────────────────────────
 
@@ -34,29 +38,32 @@ import { logger } from '../utils/logger';
  * circuit execution before any resolver runs — the cleanest approach for this
  * version of graphql-yoga that doesn't require an external depth-limit package.
  */
-function createBlockIntrospectionPlugin() {
+export function createBlockIntrospectionPlugin() {
   return {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     onExecute({ args, setResultAndStopExecution }: any) {
-      const defs: readonly import('graphql').DefinitionNode[] =
-        args?.document?.definitions ?? [];
-      for (const def of defs) {
-        if (def.kind !== Kind.OPERATION_DEFINITION) continue;
-        for (const sel of def.selectionSet.selections) {
-          if (
-            sel.kind === Kind.FIELD &&
-            (sel.name.value === '__schema' || sel.name.value === '__type')
-          ) {
-            setResultAndStopExecution({
-              errors: [
-                new GraphQLError('GraphQL introspection is disabled in production.', {
-                  extensions: { code: 'INTROSPECTION_DISABLED' },
-                }),
-              ],
-            });
-            return;
+      const document = args?.document;
+      if (!document) return;
+
+      let containsIntrospection = false;
+      visit(document, {
+        Field(node) {
+          if (node.name.value === '__schema' || node.name.value === '__type') {
+            containsIntrospection = true;
+            return false;
           }
-        }
+          return undefined;
+        },
+      });
+
+      if (containsIntrospection) {
+        setResultAndStopExecution({
+          errors: [
+            new GraphQLError('GraphQL introspection is disabled in production.', {
+              extensions: { code: 'INTROSPECTION_DISABLED' },
+            }),
+          ],
+        });
       }
     },
   };
@@ -70,7 +77,16 @@ function createBlockIntrospectionPlugin() {
  */
 export function mountGraphQL(app: Application): void {
   const isProduction = process.env.NODE_ENV === 'production';
+  const graphqlIpRateLimit = rateLimit({ name: 'graphql' });
+  const graphqlWalletRateLimit = walletRateLimit({ name: 'graphql' });
 
+  // Persisted operations plugin is always enabled (controls both dev and prod modes)
+  const plugins = [
+    useValidationRule(createDepthLimitRule(MAX_DEPTH)),
+    createPersistedOperationsPlugin(),
+    ...(isProduction ? [createBlockIntrospectionPlugin()] : []),
+  ];
+  
   const yoga = createYoga({
     schema: createSchema({
       typeDefs,
@@ -100,13 +116,19 @@ export function mountGraphQL(app: Application): void {
   // Dynamic per-request feature-flag guard (#1126). The /graphql endpoint is
   // served only when `graphql_enabled` is on; otherwise it 404s exactly like an
   // unmounted route. Toggle takes effect within one flag-cache TTL, no restart.
-  app.use('/graphql', (req: Request, res: Response, next: NextFunction) => {
-    if (!isEnabled(GRAPHQL_ENABLED)) {
-      res.status(404).json({ success: false, error: 'Not Found', code: 'NOT_FOUND' });
-      return;
-    }
-    next();
-  });
+  app.use(
+    '/graphql',
+    optionalAuth,
+    graphqlIpRateLimit,
+    graphqlWalletRateLimit,
+    (req: Request, res: Response, next: NextFunction) => {
+      if (!isEnabled(GRAPHQL_ENABLED)) {
+        res.status(404).json({ success: false, error: 'Not Found', code: 'NOT_FOUND' });
+        return;
+      }
+      next();
+    },
+  );
 
   // graphql-yoga returns a standard request handler compatible with Express
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

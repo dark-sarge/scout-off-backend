@@ -101,6 +101,16 @@ pass "default replicaCount renders as 1"
 grep -q 'DB_DRIVER: "sqlite"' <<<"${out}" || fail "default DB_DRIVER is not sqlite"
 pass "default DB_DRIVER renders as sqlite"
 
+grep -q 'kind: NetworkPolicy' <<<"${out}" || fail "default NetworkPolicy is not rendered"
+grep -q 'readOnlyRootFilesystem: true' <<<"${out}" \
+  || fail "container root filesystem is not read-only"
+grep -q 'runAsNonRoot: true' <<<"${out}" || fail "pod does not require a non-root user"
+grep -q 'runAsUser: 1000' <<<"${out}" || fail "pod runAsUser is not 1000"
+grep -q 'type: RuntimeDefault' <<<"${out}" || fail "pod seccomp profile is not RuntimeDefault"
+grep -q 'mountPath: "/data"' <<<"${out}" || fail "writable /data volume mount is missing"
+grep -q 'emptyDir: {}' <<<"${out}" || fail "default /data volume is not writable"
+pass "default pod security settings and NetworkPolicy render"
+
 if grep -q "kind: HorizontalPodAutoscaler" <<<"${out}"; then
   fail "HPA rendered despite hpa.enabled=false default"
 fi
@@ -155,5 +165,13 @@ if grep -q "WARNING: DB_DRIVER=sqlite" <<<"${notes}"; then
   fail "postgres + HPA enabled wrongly warns"
 fi
 pass "postgres + HPA enabled renders HPA without warning"
+
+out=$(render --set dataVolume.persistentVolumeClaim=scout-off-data)
+grep -q 'claimName: "scout-off-data"' <<<"${out}" \
+  || fail "dataVolume.persistentVolumeClaim override was not applied"
+if grep -q 'emptyDir: {}' <<<"${out}"; then
+  fail "emptyDir rendered despite configured data PVC"
+fi
+pass "configured data PVC replaces the default emptyDir"
 
 echo "[validate-helm-chart] All Helm chart consistency checks passed."

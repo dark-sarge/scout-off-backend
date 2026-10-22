@@ -63,6 +63,11 @@ components:
         maxLength: 56
       description: Stellar public key (G…)
   schemas:
+    ErrorCode:
+      type: string
+      description: Machine-readable error code returned in API responses.
+      enum:
+        - REQUEST_TIMEOUT
     SuccessEnvelope:
       type: object
       required:
@@ -94,6 +99,16 @@ components:
       properties:
         player_id:
           type: string
+          description: API player identifier (cuid2)
+        on_chain_player_id:
+          type: string
+          nullable: true
+          description: Sequential u64 ID assigned by the register contract; null while registration is pending
+        registration_status:
+          type: string
+          enum:
+            - pending
+            - registered
         wallet:
           type: string
         position:
@@ -1741,6 +1756,28 @@ paths:
         '500':
           description: '{ success: false, error: string } - Spec file missing or unparsable'
       security: []
+  /docs/swagger-ui-bundle.js:
+    get:
+      tags:
+        - docs
+      summary: Serves the Swagger UI JavaScript bundle from swagger-ui-dist for the /ui page.
+      operationId: getDocsSwagger-ui-bundle.js
+      description: Serves the Swagger UI JavaScript bundle from swagger-ui-dist for the /ui page.
+      responses:
+        '200':
+          description: Swagger UI JavaScript bundle (text/javascript)
+      security: []
+  /docs/swagger-ui.css:
+    get:
+      tags:
+        - docs
+      summary: Serves the Swagger UI stylesheet from swagger-ui-dist for the /ui page.
+      operationId: getDocsSwagger-ui.css
+      description: Serves the Swagger UI stylesheet from swagger-ui-dist for the /ui page.
+      responses:
+        '200':
+          description: Swagger UI stylesheet (text/css)
+      security: []
   /docs/ui:
     get:
       tags:
@@ -1783,15 +1820,19 @@ paths:
         Authentication: Bearer JWT (same as all other protected routes).
 
         Query parameters (all optional, combinable):
-          - eventType  One event type name to subscribe to (e.g. "milestone_approved").
-                       When omitted the client receives all event types that pass the
-                       wallet-relevance filter.  Unknown values are ignored.
+          - eventType  One or more event type names to subscribe to, comma-separated
+                       (e.g. "milestone_approved" or
+                       "milestone_approved,scout_subscribed"). When omitted the
+                       client receives all event types that pass the
+                       wallet-relevance filter. Unknown values are rejected with 400.
           - playerId   Only deliver events whose payload contains this player identifier.
                        When omitted no additional player-level filtering is applied.
 
         Filtering: only events relevant to the authenticated wallet are sent (wallet
-        isolation is always enforced regardless of query params).  The optional
-        query params add further narrowing on top.
+        isolation is always enforced regardless of query params). Player events are
+        matched through the authenticated wallet's player record, since their payload
+        carries a player ID rather than a wallet address. Optional query params add
+        further narrowing on top.
 
         SSE event types sent:
           - milestone_approved  (player: their own milestone approvals)
@@ -1809,23 +1850,37 @@ paths:
             no further protected events are delivered.
           - If the wallet is blocklisted while the stream is open, the same
             termination happens with reason "wallet_blocklisted".
+          - When the access JWT expires, the stream closes with reason "token_expired".
           - Detection bound: immediate for revocations/blocklists processed in
             this process; ≤ SSE_AUTH_SWEEP_INTERVAL_MS (default 30 s) for changes
             persisted by another instance (one sweep query per process, never a
             DB query per keep-alive tick).
           - Blocklisted wallets cannot open a new connection (403).
+          - Concurrent streams are limited per wallet by
+            SSE_MAX_CONNECTIONS_PER_WALLET (default 5; 0 = unlimited).
+
+        Reconnection: initial `retry:` hint is sent on connect (configured via
+        SSE_RETRY_MS, default 5000 ms + up to 20% random jitter) to prevent reconnect storms.
 
         Keep-alive: a `: ping` comment is sent every SSE_KEEPALIVE_INTERVAL_MS ms
         (default 15 s) to prevent idle-connection timeouts.
       responses:
         '200':
           description: text/event-stream — long-lived SSE connection
+        '400':
+          description: >-
+            { success: false, error: string, code: string, validEventTypes: string[] } — unknown
+            eventType
         '401':
           description: '{ success: false, error: string } — missing or invalid token'
         '403':
-          description: '{ success: false, error: string } — wallet is blocklisted'
+          description: '{ success: false, error: string, code: ''WALLET_BLOCKLISTED'' } — wallet is blocklisted'
+        '429':
+          description: '{ success: false, error: string } — per-wallet connection limit reached'
         '503':
-          description: '{ success: false, error: string } — connection limit reached'
+          description: >-
+            { success: false, error: string, code: 'SSE_CAPACITY' } — global connection limit
+            reached (sets Retry-After)
       security:
         - bearerAuth: []
   /players:
@@ -1975,7 +2030,9 @@ paths:
                   additionalProperties: false
       responses:
         '201':
-          description: '{ success: true, data: { playerId, metadataUri, gatewayUrl } }'
+          description: >-
+            { success: true, data: { playerId, onChainPlayerId, registrationStatus,
+            onChainRegistration, metadataUri, gatewayUrl } }
         '400':
           description: '{ success: false, error: string } - Invalid body'
         '403':
@@ -2383,6 +2440,8 @@ paths:
       description: |-
         Purchase Player Tokens for the given player (stub — no real XLM transfer).
         Gated by the `player_tokens` feature flag — returns 404 when disabled.
+        The authenticated account is the buyer; the optional buyerWallet field is
+        accepted for compatibility only when it matches that account.
       parameters:
         - name: playerId
           in: path
@@ -2392,7 +2451,7 @@ paths:
           description: The player's on-chain identifier
       requestBody:
         required: true
-        description: '{ amount: number, buyerWallet: string }'
+        description: '{ amount: number, buyerWallet?: string }'
         content:
           application/json:
             schema:
@@ -2406,13 +2465,16 @@ paths:
                   minLength: 1
               required:
                 - amount
-                - buyerWallet
               additionalProperties: false
       responses:
         '200':
           description: '{ success: true, data: { playerId, buyerWallet, amount, newBalance } }'
         '400':
           description: '{ success: false, error: string } - Invalid amount'
+        '401':
+          description: '{ success: false, error: string } - Authentication required'
+        '403':
+          description: '{ success: false, error: string } - buyerWallet does not match authenticated account'
         '404':
           description: '{ success: false, error: string } - Feature flag disabled or player not found'
       security:
@@ -2531,8 +2593,11 @@ paths:
             revoked_at, scopes }> }
       security:
         - bearerAuth: []
+        - apiKeyAuth:
+            - read:api_keys
       x-required-role:
         - scout
+      x-api-key-scope: read:api_keys
       x-owner-only: true
     post:
       tags:
@@ -2695,8 +2760,11 @@ paths:
           description: '{ success: true, data: Array<{ id, scout_wallet, name, created_at, bookmark_count }> }'
       security:
         - bearerAuth: []
+        - apiKeyAuth:
+            - read:bookmarks
       x-required-role:
         - scout
+      x-api-key-scope: read:bookmarks
       x-owner-only: true
     post:
       tags:
@@ -2801,8 +2869,11 @@ paths:
           description: '{ success: true, data: Array<PlayerSummary & { bookmarked_at, folder_id, note }> }'
       security:
         - bearerAuth: []
+        - apiKeyAuth:
+            - read:bookmarks
       x-required-role:
         - scout
+      x-api-key-scope: read:bookmarks
       x-owner-only: true
     post:
       tags:
@@ -2917,8 +2988,11 @@ paths:
           description: '{ success: false, error: string } - Wallet mismatch or missing token'
       security:
         - bearerAuth: []
+        - apiKeyAuth:
+            - read:contacts
       x-required-role:
         - scout
+      x-api-key-scope: read:contacts
       x-owner-only: true
   /scouts/{wallet}/contacts/{playerId}:
     get:
@@ -2951,8 +3025,11 @@ paths:
           description: '{ success: false, error: string } - Player not found'
       security:
         - bearerAuth: []
+        - apiKeyAuth:
+            - read:contacts
       x-required-role:
         - scout
+      x-api-key-scope: read:contacts
       x-owner-only: true
   /scouts/{wallet}/contacts/{playerId}/unlock:
     post:
@@ -3045,8 +3122,11 @@ paths:
           description: '{ success: false, error: string } - Wallet mismatch'
       security:
         - bearerAuth: []
+        - apiKeyAuth:
+            - read:dashboard
       x-required-role:
         - scout
+      x-api-key-scope: read:dashboard
       x-owner-only: true
   /scouts/{wallet}/notes:
     get:
@@ -3067,8 +3147,11 @@ paths:
           description: '{ success: true, data: Array<{ scout_wallet, player_id, note, updated_at }> }'
       security:
         - bearerAuth: []
+        - apiKeyAuth:
+            - read:notes
       x-required-role:
         - scout
+      x-api-key-scope: read:notes
       x-owner-only: true
   /scouts/{wallet}/notes/{playerId}:
     get:
@@ -3097,8 +3180,11 @@ paths:
           description: '{ success: false, error: string } - No note exists yet'
       security:
         - bearerAuth: []
+        - apiKeyAuth:
+            - read:notes
       x-required-role:
         - scout
+      x-api-key-scope: read:notes
       x-owner-only: true
     put:
       tags:
@@ -3212,8 +3298,11 @@ paths:
           description: '{ success: false, error: string } - Invalid query parameters or dates'
       security:
         - bearerAuth: []
+        - apiKeyAuth:
+            - read:payments
       x-required-role:
         - scout
+      x-api-key-scope: read:payments
       x-owner-only: true
   /scouts/{wallet}/players/{playerId}/notes:
     get:
@@ -3244,8 +3333,11 @@ paths:
           description: '{ success: false, error: string } - Wallet mismatch'
       security:
         - bearerAuth: []
+        - apiKeyAuth:
+            - read:notes
       x-required-role:
         - scout
+      x-api-key-scope: read:notes
       x-owner-only: true
     post:
       tags:
@@ -3434,8 +3526,11 @@ paths:
           description: '{ success: false, error: string } - Invalid query parameters'
       security:
         - bearerAuth: []
+        - apiKeyAuth:
+            - read:recommendations
       x-required-role:
         - scout
+      x-api-key-scope: read:recommendations
       x-owner-only: true
   /scouts/{wallet}/saved-searches:
     get:
@@ -3459,10 +3554,10 @@ paths:
       security:
         - bearerAuth: []
         - apiKeyAuth:
-            - write:saved_searches
+            - read:saved_searches
       x-required-role:
         - scout
-      x-api-key-scope: write:saved_searches
+      x-api-key-scope: read:saved_searches
       x-owner-only: true
     post:
       tags:
@@ -3666,8 +3761,11 @@ paths:
           description: '{ success: false, error: string } - Saved search not found'
       security:
         - bearerAuth: []
+        - apiKeyAuth:
+            - read:saved_searches
       x-required-role:
         - scout
+      x-api-key-scope: read:saved_searches
       x-owner-only: true
   /scouts/{wallet}/subscribe:
     post:
@@ -3847,13 +3945,14 @@ paths:
       tags:
         - scouts
       summary: DEPRECATED alias of POST /api/scouts/:wallet/trial-offers (#1034).
-      operationId: createTrialOffer
+      operationId: createTrialOfferAtScoutsByWalletTrialOfferPost
       description: |-
         DEPRECATED alias of POST /api/scouts/:wallet/trial-offers (#1034). It runs the
         same handler, so it carries the same middleware chain — including walletRateLimit
         and idempotency, which guard the on-chain submission this route now performs.
 
         Use POST /api/scouts/:wallet/trial-offers instead.
+        Responses include the RFC 9745 Deprecation header, effective 2026-08-18.
       deprecated: true
       parameters:
         - name: wallet
@@ -3923,15 +4022,21 @@ paths:
       responses:
         '200':
           description: '{ success: true, data: TrialOfferEvent[] }'
+        '403':
+          description: '{ success: false, error: string } - Wallet mismatch (non-admin/non-owner)'
       security:
         - bearerAuth: []
+        - apiKeyAuth:
+            - read:trial_offers
       x-required-role:
         - scout
+      x-api-key-scope: read:trial_offers
+      x-owner-only: true
     post:
       tags:
         - scouts
       summary: Submit a trial offer on-chain and promote the player to Elite Tier.
-      operationId: createTrialOffer
+      operationId: createTrialOfferAtScoutsByWalletTrialOffersPost
       description: |-
         Canonical trial-offer submission (#285, #770): submits the offer on-chain,
         indexes it locally by tx_hash, promotes the player's tier and broadcasts SSE.
@@ -4054,8 +4159,11 @@ paths:
           description: '{ success: false, error: string } - Wallet mismatch'
       security:
         - bearerAuth: []
+        - apiKeyAuth:
+            - read:webhooks
       x-required-role:
         - scout
+      x-api-key-scope: read:webhooks
       x-owner-only: true
     post:
       tags:
@@ -4314,7 +4422,7 @@ paths:
       summary: >-
         List pending milestones for the authenticated validator, optionally filtered by
         region/position/playerId and paginated.
-      operationId: getPendingMilestones
+      operationId: getPendingMilestonesAtValidatorsMilestonesPendingGet
       description: |-
         List pending milestones for the authenticated validator, optionally
         filtered by region/position/playerId and paginated.
@@ -4371,7 +4479,7 @@ paths:
       summary: >-
         Same as GET /api/validators/milestones/pending, scoped explicitly to the given validator
         wallet rather than the caller's own token.
-      operationId: getPendingMilestones
+      operationId: getPendingMilestonesAtValidatorsByWalletMilestonesPendingGet
       description: |-
         Same as GET /api/validators/milestones/pending, scoped explicitly to the
         given validator wallet rather than the caller's own token.
@@ -4423,10 +4531,13 @@ paths:
       responses:
         '200':
           description: '{ success: true, data: PendingMilestone[], total, page, pageSize }'
+        '403':
+          description: '{ success: false, error: string } - Wallet mismatch (non-admin/non-owner)'
       security:
         - bearerAuth: []
       x-required-role:
         - validator
+      x-owner-only: true
   /validators/{wallet}/stats:
     get:
       tags:

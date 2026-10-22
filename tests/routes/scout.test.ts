@@ -106,12 +106,12 @@ describe('GET /api/scouts/:wallet/subscription', () => {
     expect(res.status).toBe(401);
   });
 
-  it('returns 401 when JWT wallet does not match path wallet', async () => {
+  it('returns 403 when JWT wallet does not match path wallet', async () => {
     const token = makeToken(OTHER);
     const res = await request(app)
       .get(`/api/scouts/${WALLET}/subscription`)
       .set('Authorization', `Bearer ${token}`);
-    expect(res.status).toBe(401);
+    expect(res.status).toBe(403);
     expect(res.body.success).toBe(false);
   });
 
@@ -286,12 +286,12 @@ describe('GET /api/scouts/:wallet/contacts', () => {
     expect(res.status).toBe(401);
   });
 
-  it('returns 401 when JWT wallet does not match path wallet', async () => {
+  it('returns 403 when JWT wallet does not match path wallet', async () => {
     const token = makeToken(OTHER);
     const res = await request(app)
       .get(`/api/scouts/${WALLET}/contacts`)
       .set('Authorization', `Bearer ${token}`);
-    expect(res.status).toBe(401);
+    expect(res.status).toBe(403);
     expect(res.body.success).toBe(false);
   });
 
@@ -540,12 +540,12 @@ describe('GET /api/scouts/:wallet/contacts/:playerId', () => {
     expect(res.status).toBe(401);
   });
 
-  it('returns 401 when JWT wallet does not match path wallet', async () => {
+  it('returns 403 when JWT wallet does not match path wallet', async () => {
     const token = makeToken(OTHER);
     const res = await request(app)
       .get(`/api/scouts/${WALLET}/contacts/${PLAYER_ID}`)
       .set('Authorization', `Bearer ${token}`);
-    expect(res.status).toBe(401);
+    expect(res.status).toBe(403);
     expect(res.body.success).toBe(false);
   });
 

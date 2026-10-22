@@ -15,13 +15,11 @@
 //!   argument.
 //! * All token amounts are stored as `u64` (stroops-equivalent precision).
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
-};
 use scout_off_shared::{
     errors::Error,
-    storage::{bump_instance, is_initialized, set_initialized},
+    storage::{bump_instance, is_initialized, is_paused, set_initialized, set_paused},
 };
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec};
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -112,6 +110,44 @@ impl PlayerTokenContract {
         Ok(())
     }
 
+    /// Pause token issuance, purchases, and fee distribution. Only the admin may call this.
+    pub fn pause(env: Env, admin: Address) -> Result<(), Error> {
+        if !is_initialized(&env) {
+            return Err(Error::NotInitialized);
+        }
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        set_paused(&env, true);
+        bump_instance(&env);
+        Ok(())
+    }
+
+    /// Resume token issuance, purchases, and fee distribution. Only the admin may call this.
+    pub fn unpause(env: Env, admin: Address) -> Result<(), Error> {
+        if !is_initialized(&env) {
+            return Err(Error::NotInitialized);
+        }
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        set_paused(&env, false);
+        bump_instance(&env);
+        Ok(())
+    }
+
     // ── Token issuance ─────────────────────────────────────────────────────
 
     /// Issue a fixed supply of Player Tokens for `player_id`.
@@ -131,6 +167,9 @@ impl PlayerTokenContract {
         if !is_initialized(&env) {
             return Err(Error::NotInitialized);
         }
+        if is_paused(&env) {
+            return Err(Error::ContractPaused);
+        }
         let admin: Address = env
             .storage()
             .instance()
@@ -141,7 +180,11 @@ impl PlayerTokenContract {
         if total_supply == 0 {
             return Err(Error::InvalidInput);
         }
-        if env.storage().persistent().has(&DataKey::TokenMeta(player_id)) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::TokenMeta(player_id))
+        {
             return Err(Error::AlreadyVerified); // already issued
         }
 
@@ -155,10 +198,8 @@ impl PlayerTokenContract {
             .persistent()
             .set(&DataKey::TokenMeta(player_id), &meta);
 
-        env.events().publish(
-            (symbol_short!("tok_iss"), player_id),
-            (total_supply,),
-        );
+        env.events()
+            .publish((symbol_short!("tok_iss"), player_id), (total_supply,));
         bump_instance(&env);
         Ok(())
     }
@@ -185,6 +226,9 @@ impl PlayerTokenContract {
         if !is_initialized(&env) {
             return Err(Error::NotInitialized);
         }
+        if is_paused(&env) {
+            return Err(Error::ContractPaused);
+        }
         buyer.require_auth();
 
         if amount == 0 {
@@ -197,7 +241,7 @@ impl PlayerTokenContract {
             .get(&DataKey::TokenMeta(player_id))
             .ok_or(Error::InvalidInput)?; // no tokens issued
 
-        let remaining = meta.total_supply.checked_sub(meta.sold).unwrap_or(0);
+        let remaining = meta.total_supply.saturating_sub(meta.sold);
         if amount > remaining {
             return Err(Error::InsufficientSupply);
         }
@@ -211,13 +255,14 @@ impl PlayerTokenContract {
             .map(|b| b.tokens)
             .unwrap_or(0);
 
-        let new_balance = prev
-            .checked_add(amount)
-            .ok_or(Error::Overflow)?;
+        let new_balance = prev.checked_add(amount).ok_or(Error::Overflow)?;
 
-        env.storage()
-            .persistent()
-            .set(&balance_key, &HolderBalance { tokens: new_balance });
+        env.storage().persistent().set(
+            &balance_key,
+            &HolderBalance {
+                tokens: new_balance,
+            },
+        );
 
         // Append to holder list only on first purchase.
         if prev == 0 {
@@ -242,7 +287,7 @@ impl PlayerTokenContract {
                     .persistent()
                     .get(&DataKey::HolderPage(player_id, last_page_index))
                     .unwrap_or_else(|| Vec::new(&env));
-                if pv.len() as u32 >= MAX_HOLDERS_PER_PAGE {
+                if pv.len() >= MAX_HOLDERS_PER_PAGE {
                     // create a new page
                     last_page_index = meta.holder_pages;
                     let mut newp: Vec<Address> = Vec::new(&env);
@@ -269,10 +314,8 @@ impl PlayerTokenContract {
             .persistent()
             .set(&DataKey::TokenMeta(player_id), &meta);
 
-        env.events().publish(
-            (symbol_short!("tok_buy"), player_id),
-            (buyer, amount),
-        );
+        env.events()
+            .publish((symbol_short!("tok_buy"), player_id), (buyer, amount));
         // No instance growth — changes are persisted per-key.
         Ok(())
     }
@@ -310,6 +353,9 @@ impl PlayerTokenContract {
     ) -> Result<u32, Error> {
         if !is_initialized(&env) {
             return Err(Error::NotInitialized);
+        }
+        if is_paused(&env) {
+            return Err(Error::ContractPaused);
         }
 
         let admin: Address = env
@@ -359,7 +405,11 @@ impl PlayerTokenContract {
         if env
             .storage()
             .persistent()
-            .has(&DataKey::ProcessedTransferPage(player_id, transfer_id, page))
+            .has(&DataKey::ProcessedTransferPage(
+                player_id,
+                transfer_id,
+                page,
+            ))
         {
             return Ok(0);
         }
@@ -367,7 +417,7 @@ impl PlayerTokenContract {
         // Read the requested holder page from persistent storage.
         // The page index is directly used to fetch a specific page of holders.
         // Guard against page overflow: page * MAX_HOLDERS_PER_PAGE must not overflow u32.
-        let _start_check = (page as u32)
+        let _start_check = page
             .checked_mul(MAX_HOLDERS_PER_PAGE)
             .ok_or(Error::Overflow)?;
 
@@ -381,7 +431,7 @@ impl PlayerTokenContract {
         let total_sold = meta.sold as u128;
 
         for i in 0..holders.len() {
-            let holder = holders.get_unchecked(i as u32);
+            let holder = holders.get_unchecked(i);
             let balance_key = DataKey::HolderBalance(player_id, holder.clone());
             let tokens: u64 = env
                 .storage()
@@ -421,14 +471,20 @@ impl PlayerTokenContract {
             .fold(0u128, |acc, p| acc.saturating_add(p.amount_stroops));
 
         // Prevent processing pages that would cause accumulated > total_fee.
-        if tinfo.accumulated.checked_add(page_total).unwrap_or(u128::MAX) > tinfo.total_fee {
+        if tinfo
+            .accumulated
+            .checked_add(page_total)
+            .unwrap_or(u128::MAX)
+            > tinfo.total_fee
+        {
             return Err(Error::InvalidInput);
         }
 
         // Persist processed-page marker and updated transfer info.
-        env.storage()
-            .persistent()
-            .set(&DataKey::ProcessedTransferPage(player_id, transfer_id, page), &1u32);
+        env.storage().persistent().set(
+            &DataKey::ProcessedTransferPage(player_id, transfer_id, page),
+            &1u32,
+        );
 
         tinfo.accumulated = tinfo.accumulated.saturating_add(page_total);
         env.storage()
@@ -437,9 +493,7 @@ impl PlayerTokenContract {
 
         // Update cumulative distributed amount (best-effort; skip on overflow).
         let mut updated_meta = meta;
-        updated_meta.total_distributed = updated_meta
-            .total_distributed
-            .saturating_add(page_total);
+        updated_meta.total_distributed = updated_meta.total_distributed.saturating_add(page_total);
         env.storage()
             .persistent()
             .set(&DataKey::TokenMeta(player_id), &updated_meta);
@@ -464,7 +518,18 @@ impl PlayerTokenContract {
     /// * `count`     — maximum number of holders to migrate in this call.
     ///
     /// Returns the number of holders migrated in this step.
-    pub fn migrate_player_step(env: Env, player_id: u64, start: u32, count: u32) -> Result<u32, Error> {
+    pub fn migrate_player_step(
+        env: Env,
+        player_id: u64,
+        start: u32,
+        count: u32,
+    ) -> Result<u32, Error> {
+        if !is_initialized(&env) {
+            return Err(Error::NotInitialized);
+        }
+        if is_paused(&env) {
+            return Err(Error::ContractPaused);
+        }
         // Only admin may perform migration.
         let admin: Address = env
             .storage()
@@ -500,7 +565,11 @@ impl PlayerTokenContract {
             let addr = legacy.get_unchecked(i);
 
             // Append to last page or create a new one when full.
-            let mut last_page_index: u32 = if meta.holder_pages == 0 { 0 } else { meta.holder_pages - 1 };
+            let mut last_page_index: u32 = if meta.holder_pages == 0 {
+                0
+            } else {
+                meta.holder_pages - 1
+            };
             if meta.holder_pages == 0 {
                 let mut pv: Vec<Address> = Vec::new(&env);
                 pv.push_back(addr.clone());
@@ -514,7 +583,7 @@ impl PlayerTokenContract {
                     .persistent()
                     .get(&DataKey::HolderPage(player_id, last_page_index))
                     .unwrap_or_else(|| Vec::new(&env));
-                if pv.len() as u32 >= MAX_HOLDERS_PER_PAGE {
+                if pv.len() >= MAX_HOLDERS_PER_PAGE {
                     last_page_index = meta.holder_pages;
                     let mut newp: Vec<Address> = Vec::new(&env);
                     newp.push_back(addr.clone());
@@ -582,7 +651,11 @@ impl PlayerTokenContract {
     pub fn get_holders(env: Env, player_id: u64) -> Vec<Address> {
         // Reconstruct full holder list by concatenating stored pages.
         let mut out: Vec<Address> = Vec::new(&env);
-        if let Some(meta) = env.storage().persistent().get::<DataKey, TokenMeta>(&DataKey::TokenMeta(player_id)) {
+        if let Some(meta) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, TokenMeta>(&DataKey::TokenMeta(player_id))
+        {
             for i in 0..meta.holder_pages {
                 let page: Vec<Address> = env
                     .storage()
@@ -636,6 +709,28 @@ mod tests {
         client.issue_tokens(&1u64, &1000u64);
         // Second issue for same player must fail.
         assert!(client.try_issue_tokens(&1u64, &500u64).is_err());
+    }
+
+    #[test]
+    fn pause_blocks_token_issuance_and_purchases_until_unpaused() {
+        let env = Env::default();
+        let (client, admin) = setup(&env);
+        let buyer = Address::generate(&env);
+        client.issue_tokens(&1u64, &100u64);
+
+        client.pause(&admin);
+        assert!(matches!(
+            client.try_issue_tokens(&2u64, &100u64),
+            Err(Ok(Error::ContractPaused))
+        ));
+        assert!(matches!(
+            client.try_buy_token(&1u64, &10u64, &buyer),
+            Err(Ok(Error::ContractPaused))
+        ));
+
+        client.unpause(&admin);
+        client.buy_token(&1u64, &10u64, &buyer);
+        assert_eq!(client.get_balance(&1u64, &buyer), 10);
     }
 
     #[test]
@@ -737,7 +832,11 @@ mod tests {
         let payouts = client.get_pending_payouts(&2u64, &0u32);
         let total: u128 = payouts.iter().map(|p| p.amount_stroops).sum();
         // Floor division: each gets 3, total = 9 (≤ 10 — rounding remainder stays in contract).
-        assert!(total <= 10, "total payouts {} must not exceed fee 10", total);
+        assert!(
+            total <= 10,
+            "total payouts {} must not exceed fee 10",
+            total
+        );
         for p in payouts.iter() {
             assert_eq!(p.amount_stroops, 3);
         }
@@ -750,7 +849,9 @@ mod tests {
         let buyer = Address::generate(&env);
         client.issue_tokens(&3u64, &100u64);
         client.buy_token(&3u64, &1u64, &buyer);
-        assert!(client.try_distribute_fee(&3u64, &0u128, &1u128, &0u32).is_err());
+        assert!(client
+            .try_distribute_fee(&3u64, &0u128, &1u128, &0u32)
+            .is_err());
     }
 
     #[test]
@@ -759,7 +860,9 @@ mod tests {
         let (client, _admin) = setup(&env);
         client.issue_tokens(&4u64, &100u64);
         // No buyers yet — sold = 0.
-        assert!(client.try_distribute_fee(&4u64, &1_000u128, &1u128, &0u32).is_err());
+        assert!(client
+            .try_distribute_fee(&4u64, &1_000u128, &1u128, &0u32)
+            .is_err());
     }
 
     #[test]
@@ -822,10 +925,11 @@ mod tests {
         // Direct storage inspection is only permitted inside a contract context.
         let (holder_page_in_instance, meta_in_instance, p0) =
             env.as_contract(&client.address, || {
-                let holder_page_in_instance =
-                    env.storage().instance().has(&DataKey::HolderPage(player_id, 0u32));
-                let meta_in_instance =
-                    env.storage().instance().has(&DataKey::TokenMeta(player_id));
+                let holder_page_in_instance = env
+                    .storage()
+                    .instance()
+                    .has(&DataKey::HolderPage(player_id, 0u32));
+                let meta_in_instance = env.storage().instance().has(&DataKey::TokenMeta(player_id));
                 let p0: Vec<PendingPayout> = env
                     .storage()
                     .persistent()
@@ -841,13 +945,13 @@ mod tests {
         assert!(!meta_in_instance);
 
         // Pending payouts should be stored in persistent storage per page.
-        assert!(p0.len() > 0);
+        assert!(!p0.is_empty());
     }
 
     #[test]
     fn migrate_player_step_batches_and_finalises() {
         let env = Env::default();
-        let (client, admin) = setup(&env);
+        let (client, _admin) = setup(&env);
 
         let player_id = 99u64;
         client.issue_tokens(&player_id, &1_000u64);
@@ -966,7 +1070,9 @@ mod tests {
         assert_eq!(ok, 1);
 
         // Same transfer_id but different total fee should be rejected.
-        assert!(client.try_distribute_fee(&pid, &2_000u128, &transfer_id, &0u32).is_err());
+        assert!(client
+            .try_distribute_fee(&pid, &2_000u128, &transfer_id, &0u32)
+            .is_err());
     }
 
     #[test]
@@ -984,7 +1090,9 @@ mod tests {
         client.buy_token(&7u64, &1u64, &buyer);
 
         // Pass empty auth list to override `env.mock_all_auths()`
-        let result = client.mock_auths(&[]).try_distribute_fee(&7u64, &1_000u128, &8001u128, &0u32);
+        let result = client
+            .mock_auths(&[])
+            .try_distribute_fee(&7u64, &1_000u128, &8001u128, &0u32);
         assert!(result.is_err());
     }
 

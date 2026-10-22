@@ -12,7 +12,6 @@ import {
   getPendingAdminActionsByStatus,
   PendingAdminActionRow,
   insertFeeWithdrawal,
-  getDriver,
 } from '../db';
 import { insertValidator, revokeValidatorRow } from './indexer';
 import { logAuditEvent } from './audit';
@@ -29,6 +28,7 @@ import {
   type FeeWithdrawalResult,
   type ContractActionResult,
 } from './stellar';
+import { insertAdminFeeConfigLog } from '../db/repositories/feeWithdrawals';
 
 export type AdminActionType =
   | 'pause_contract'
@@ -179,7 +179,33 @@ async function runAdminActionInternal(
         if (!Number.isInteger(newFeeBps) || newFeeBps < 0 || newFeeBps > 10000) {
           return { success: false, error: 'newFeeBps must be an integer between 0 and 10000', errorCode: 'INVALID_PAYLOAD' };
         }
-        const result = await stellarUpdatePlatformFee(newFeeBps);
+        let result;
+        try {
+          result = await stellarUpdatePlatformFee(newFeeBps);
+        } catch (feeErr) {
+          const code = (feeErr as { code?: string }).code ?? 'EXECUTION_FAILED';
+          const mapped =
+            code === 'INVALID_INPUT' ? 'INVALID_PAYLOAD'
+            : code === 'UNAUTHORIZED' ? 'UNAUTHORIZED'
+            : code === 'CONTRACT_PAUSED' ? 'CONTRACT_PAUSED'
+            : code === 'NOT_INITIALIZED' ? 'CONTRACT_NOT_INITIALIZED'
+            : 'NETWORK_ERROR';
+          return { success: false, error: (feeErr as Error).message, errorCode: mapped };
+        }
+        // Persist an audit row for the fee change so it appears in the fee_withdrawals-style log.
+        try {
+          await insertAdminFeeConfigLog({
+            txHash: result.transactionId,
+            newFeeBps: result.newFeeBps,
+            adminWallet: proposer,
+            createdAt: Date.now(),
+          });
+        } catch (dbErr) {
+          // Log but don't fail — the on-chain update succeeded and is the source of truth.
+          logger.error(
+            `[multisig] fee_config_log_insert_failed txHash=${result.transactionId} err=${dbErr instanceof Error ? dbErr.message : dbErr}`,
+          );
+        }
         return { success: true, transactionId: result.transactionId, newFeeBps: result.newFeeBps };
       }
 

@@ -44,7 +44,7 @@ describe('errorHandler - Express 5 automatic promise rejection handling', () => 
     expect(res.status).toHaveBeenCalledWith(500);
     const body = getBody(res);
     expect(body.success).toBe(false);
-    expect(body.error).toBe('async error');
+    expect(body.error).toBe('Internal Server Error');
     expect(body.correlationId).toBe('test-corr-id');
   });
 
@@ -112,6 +112,6 @@ describe('errorHandler - Express 5 automatic promise rejection handling', () => 
     expect(res.status).toHaveBeenCalledWith(500);
     const body = getBody(res);
     expect(body.success).toBe(false);
-    expect(body.error).toBe('test error');
+    expect(body.error).toBe('Internal Server Error');
   });
 });

@@ -21,8 +21,12 @@ jest.mock('../../src/services/ipfs', () => ({
 }));
 
 import request from 'supertest';
+import express from 'express';
+import jwt from 'jsonwebtoken';
 import app from '../../src/app';
 import * as featureFlags from '../../src/services/featureFlags';
+import config from '../../src/config';
+import { mountGraphQL } from '../../src/graphql';
 
 const mockIsEnabled = featureFlags.isEnabled as jest.Mock;
 
@@ -76,6 +80,60 @@ describe('POST /graphql — feature flag gating', () => {
       .send({ query: '{ __typename }' })
       .set('Content-Type', 'application/json');
     expect(res.status).toBe(404);
+  });
+});
+
+describe('GraphQL rate limiting', () => {
+  it('limits requests by IP and authenticated wallet', async () => {
+    const previousMax = config.rateLimit.max;
+    config.rateLimit.max = 1;
+
+    try {
+      const rateLimitedApp = express();
+      rateLimitedApp.set('trust proxy', true);
+      rateLimitedApp.use(express.json());
+      mockIsEnabled.mockReturnValue(true);
+      mountGraphQL(rateLimitedApp);
+
+      const ip = `198.51.100.${Math.floor(Math.random() * 200) + 1}`;
+      const firstIpRequest = await request(rateLimitedApp)
+        .post('/graphql')
+        .set('X-Forwarded-For', ip)
+        .send({ query: '{ __typename }' });
+      const secondIpRequest = await request(rateLimitedApp)
+        .post('/graphql')
+        .set('X-Forwarded-For', ip)
+        .send({ query: '{ __typename }' });
+
+      expect(firstIpRequest.status).not.toBe(429);
+      expect(secondIpRequest.status).toBe(429);
+
+      const wallet = `G${Date.now()}WALLET`;
+      const walletIp = `198.51.101.${Math.floor(Math.random() * 200) + 1}`;
+      const token = jwt.sign({ sub: wallet, role: 'scout' }, config.jwtSecret, {
+        expiresIn: '1h',
+      });
+      const walletLimitedApp = express();
+      walletLimitedApp.set('trust proxy', true);
+      walletLimitedApp.use(express.json());
+      mountGraphQL(walletLimitedApp);
+
+      const firstWalletRequest = await request(walletLimitedApp)
+        .post('/graphql')
+        .set('X-Forwarded-For', walletIp)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ query: '{ __typename }' });
+      const secondWalletRequest = await request(walletLimitedApp)
+        .post('/graphql')
+        .set('X-Forwarded-For', `198.51.102.${Math.floor(Math.random() * 200) + 1}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ query: '{ __typename }' });
+
+      expect(firstWalletRequest.status).not.toBe(429);
+      expect(secondWalletRequest.status).toBe(429);
+    } finally {
+      config.rateLimit.max = previousMax;
+    }
   });
 });
 

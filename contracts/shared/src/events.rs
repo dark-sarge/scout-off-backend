@@ -6,8 +6,7 @@ pub fn emit_initialized(env: &Env, admin: &Address) {
 }
 
 pub fn emit_paused(env: &Env, paused: bool) {
-    env.events()
-        .publish((symbol_short!("pause"),), (paused,));
+    env.events().publish((symbol_short!("pause"),), (paused,));
 }
 
 pub fn emit_scout_subscribed(

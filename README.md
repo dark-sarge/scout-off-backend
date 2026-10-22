@@ -22,6 +22,7 @@ Stellar is the backbone: sub-cent transaction fees mean a scout in Europe can pa
 - **Subscription Model**: Scouts can hold an active subscription for unlimited browsing within a tier
 - **SEP-10 Auth**: Players and scouts log in securely with a Stellar wallet (Freighter, Albedo, or Lobstr)
 - **Auth docs**: See docs/auth.md for SEP-10 challenge flow, JWT lifecycle, token refresh, and example requests.
+- **Typed API client**: Use the versioned TypeScript client generated from the OpenAPI contract in [clients/typescript](clients/typescript/README.md).
 - **GraphQL docs**: See [docs/graphql.md](docs/graphql.md) for the read-only GraphQL endpoint, schema, limits, and authentication.
 - **Decentralized Storage**: Highlight reels and photos stored on IPFS; content hashes saved on-chain in the player's profile
 
@@ -339,6 +340,9 @@ npm run dev
 | `npm run build` | `tsc`                                                     | Compile TypeScript to `dist/`               |
 | `npm start`     | `node dist/index.js`                                      | Run the compiled server (run `build` first) |
 | `npm test`      | `jest --runInBand`                                        | Run the test suite                          |
+| `npm run test:contracts` | Unit and invariant contract tests (CI-equivalent) | Run the Rust workspace tests                 |
+| `npm run test:contracts:unit` | `cargo test --workspace --lib`                   | Run contract unit tests                      |
+| `npm run test:contracts:invariants` | `cargo test --workspace --tests ... invariants` | Run contract invariant tests (256 cases)      |
 | `npm run lint`  | `eslint 'src/**/*.ts' 'tests/**/*.ts' --ext .ts`          | Run TypeScript linting                      |
 | `npm run seed`  | `ts-node --project tsconfig.scripts.json scripts/seed.ts` | Seed the local DB with sample data          |
 | `npm run backfill` | `node scripts/backfill.js`                             | Reset the indexer's last_ledger to replay events from a given ledger |
@@ -729,14 +733,14 @@ Both external dependency checks are stubbed in tests — see `tests/routes/healt
 
 ### IPFS Service Dependency
 
-The backend uses [Pinata](https://pinata.cloud) to pin player metadata and milestone evidence to IPFS. The service is **optional in local development** — when `PINATA_API_KEY` and `PINATA_SECRET` are not set, `pinJson`, `pinFile`, and `checkHealth` fall back to deterministic stub behaviour and log a `[warn]` on each call. No network requests are made.
+The backend uses [Pinata](https://pinata.cloud) to pin player metadata and milestone evidence to IPFS. The service is **optional in local development and tests** — when `PINATA_API_KEY` and `PINATA_SECRET` are not set, `pinJson`, `pinFile`, and `checkHealth` fall back to deterministic stub behaviour and log a `[warn]` on each call. No Pinata network requests are made.
 
-In **production** (`NODE_ENV=production`) the same functions throw immediately if the credentials are absent, preventing silent data loss.
+In **staging and production** the same functions throw immediately if the credentials are absent, preventing silent data loss and fake CIDs from being stored as real evidence.
 
 | Env var          | Required        | Description                                                       |
 | ---------------- | --------------- | ----------------------------------------------------------------- |
-| `PINATA_API_KEY` | production only | Pinata API key                                                    |
-| `PINATA_SECRET`  | production only | Pinata secret key                                                 |
+| `PINATA_API_KEY` | staging/production | Pinata API key                                                 |
+| `PINATA_SECRET`  | staging/production | Pinata secret key                                               |
 | `PINATA_GATEWAY` | no              | Public gateway base URL (default: `https://gateway.pinata.cloud`) |
 
 ## How It Works
@@ -801,6 +805,10 @@ Operator topics (secrets rotation, data privacy, Postgres migration, deployment)
 | `DB_PATH`                         | SQLite database file path (default: `scout-off.db`)                                                                   |
 | `DATABASE_URL`                    | PostgreSQL connection URL (required when `DB_DRIVER=postgres`)                                                        |
 | `DATABASE_SSL`                    | PostgreSQL SSL mode: `true`, `no-verify`, or `false` (default: `false`)                                               |
+| `SQLITE_BUSY_TIMEOUT_MS`          | SQLite lock-contention wait before returning `SQLITE_BUSY` (default: `5000`)                                          |
+| `DB_STATEMENT_TIMEOUT_MS`         | PostgreSQL server-side statement timeout in milliseconds (default: `25000`)                                           |
+| `DB_QUERY_TIMEOUT_MS`             | PostgreSQL client query timeout in milliseconds (default: `30000`)                                                    |
+| `DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS` | PostgreSQL idle-in-transaction timeout in milliseconds (default: `60000`)                               |
 | `LOG_LEVEL`                       | Log verbosity: `debug`, `info`, `warn`, `error` (default: `info`)                                                     |
 | `LOG_SKIP_PATHS`                  | Comma-separated paths to skip in request logging (default: health and metrics probes)                                 |
 | `LOG_SAMPLE_RATE`                 | Sample rate for non-skipped paths (default: `1` = log all)                                                            |
@@ -814,7 +822,8 @@ Operator topics (secrets rotation, data privacy, Postgres migration, deployment)
 | `RATE_LIMIT_WINDOW_MS`            | Rate limit window in milliseconds (default: `60000`)                                                                  |
 | `RATE_LIMIT_MAX`                  | Max requests per window (default: `60`)                                                                               |
 | `AUTH_RATE_LIMIT_WINDOW_MS`       | Auth rate limit window in milliseconds (default: `60000`)                                                             |
-| `AUTH_RATE_LIMIT_MAX`             | Max auth requests per window (default: `5`)                                                                           |
+| `AUTH_RATE_LIMIT_MAX`             | Max auth requests per account and endpoint per window (default: `5`)                                                  |
+| `AUTH_RATE_LIMIT_IP_MAX`          | Max requests per auth endpoint per IP and window (default: `60`)                                                      |
 | `CORS_ALLOWED_ORIGINS`            | Comma-separated list of allowed origins (environment-specific defaults)                                               |
 | `TRUSTED_PROXY_COUNT`             | Number of trusted reverse-proxy hops (default: `1`)                                                                   |
 | `WEBHOOK_ENABLED`                 | Set to `true` to enable event webhooks (default: `false`)                                                             |
@@ -834,13 +843,24 @@ Operator topics (secrets rotation, data privacy, Postgres migration, deployment)
 | `ADMIN_IP_ALLOWLIST`              | Comma-separated list of IPv4 addresses/CIDRs allowed on admin routes (unset = allow all)                              |
 | `SLOW_QUERY_THRESHOLD_MS`         | Log a structured warning for DB queries slower than this, in milliseconds (default: `50`)                             |
 | `SSE_KEEPALIVE_INTERVAL_MS`       | Interval in milliseconds to send SSE keep-alive comments (default: `15000` = 15 seconds)                              |
+| `SSE_MAX_CONNECTIONS_PER_WALLET` | Maximum simultaneous SSE streams per wallet (default: `5`; `0` = unlimited)                                           |
 | `SSE_MAX_CONNECTIONS`             | Maximum number of concurrent SSE connections (default: `0` = unlimited)                                               |
+| `SSE_RETRY_MS`                     | Base reconnection delay in milliseconds sent to SSE clients in `retry:` frame (default: `5000` = 5 seconds)             |
+| `READINESS_DB_TIMEOUT_MS`         | Per-probe timeout for DB readiness heartbeat check, in milliseconds (default: `2000`)                                  |
+| `READINESS_IPFS_TIMEOUT_MS`       | Per-probe timeout for Pinata IPFS connectivity readiness check, in milliseconds (default: `5000`)                      |
+| `READINESS_STELLAR_TIMEOUT_MS`    | Per-probe timeout for Stellar RPC connectivity readiness check, in milliseconds (default: `5000`)                     |
+| `MILESTONE_RATE_WINDOW_MS`        | Rolling time window for validator milestone evidence submissions, in milliseconds (default: `60000`)                  |
+| `MILESTONE_RATE_MAX`              | Max milestone evidence submissions per window per caller (default: `10`)                                              |
+| `CIRCUIT_BREAKER_FAILURE_THRESHOLD`| Consecutive failures before generic circuit breaker trips open (default: `5`)                                          |
+| `CIRCUIT_BREAKER_RESET_TIMEOUT_MS`| Cooldown period in milliseconds before generic circuit breaker tests dependency recovery (default: `30000`)          |
+| `IPFS_BREAKER_FAILURE_THRESHOLD`  | Consecutive failures before Pinata IPFS circuit breaker trips open (default: `5`)                                      |
+| `IPFS_BREAKER_RESET_TIMEOUT_MS`   | Cooldown period in milliseconds before Pinata IPFS circuit breaker tests recovery (default: `30000`)                  |
 
 ## Testing
 
 ```bash
-# Smart contract tests (all four Soroban contracts are implemented and tested)
-cd contracts && cargo test
+# Smart contract tests (workspace unit tests and CI-sized invariant tests)
+npm run test:contracts
 
 # Backend tests
 npm run test
@@ -1173,3 +1193,8 @@ Fixes #XXX / Related to #YYY
 - **Contributing via Drips?** Visit the [Drips contributor portal](https://drips.network) for wave-specific guidance
 
 Please see [CONTRIBUTING.md](CONTRIBUTING.md) for additional guidelines.
+
+## Handsoff notes
+
+<!-- handsoff-issue-1392 -->
+- #1392: Add a Mermaid sequence diagram of the full SEP-10 + refresh/logout lifecycle to docs/auth.md

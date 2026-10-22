@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import fs from 'fs';
+import { getMigrationFiles } from './migration-files';
 
 /**
  * Represents a discovered migration file in the db/ directory.
@@ -41,20 +41,14 @@ export interface StatusReport {
 }
 
 /**
- * Discovers all .sql files in the migration directory.
- * Returns filenames sorted alphabetically, consistent with src/db/migrate.ts.
+ * Discovers forward migration files, sorted alphabetically like the runner.
  *
  * @param migrationsDir - The directory path to scan for migration files
  * @returns Array of discovered migration filenames, sorted alphabetically
  * @throws Error if the directory cannot be read
  */
 export function discoverMigrationFiles(migrationsDir: string): string[] {
-  const files = fs
-    .readdirSync(migrationsDir)
-    .filter((f) => f.endsWith('.sql'))
-    .sort();
-
-  return files;
+  return getMigrationFiles(migrationsDir).upFiles;
 }
 
 /**

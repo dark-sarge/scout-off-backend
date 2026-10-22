@@ -7,6 +7,7 @@ jest.mock('../../src/config', () => ({
 }));
 
 import { requestTimeout, createTimeout } from '../../src/middleware/timeout';
+import { ErrorCode } from '../../src/utils/errorCodes';
 
 function makeReqRes() {
   const listeners: Record<string, (() => void)[]> = {};
@@ -20,6 +21,7 @@ function makeReqRes() {
       listeners[event] = listeners[event] ?? [];
       listeners[event].push(cb);
     },
+    setHeader() { return this; },
     status(code: number) { statusCode = code; return this; },
     json(data: unknown) { body = data; _headersSent = true; return this; },
     emit(event: string) { (listeners[event] ?? []).forEach(cb => cb()); },
@@ -33,7 +35,10 @@ function makeReqRes() {
     _getBody: () => unknown;
   };
 
-  const req = {} as Request;
+  const req = {
+    on() { return this; },
+    removeListener() { return this; },
+  } as unknown as Request;
   const next = jest.fn() as NextFunction;
   return { req, res, next };
 }
@@ -59,7 +64,7 @@ describe('requestTimeout middleware', () => {
     jest.advanceTimersByTime(200);
     expect(res._getStatus()).toBe(503);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((res._getBody() as any).code).toBe('REQUEST_TIMEOUT');
+    expect((res._getBody() as any).code).toBe(ErrorCode.REQUEST_TIMEOUT);
   });
 
   it('does not fire before the timeout', () => {
@@ -118,7 +123,7 @@ describe('createTimeout(ms)', () => {
     jest.advanceTimersByTime(1);
     expect(res._getStatus()).toBe(503);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((res._getBody() as any).code).toBe('REQUEST_TIMEOUT');
+    expect((res._getBody() as any).code).toBe(ErrorCode.REQUEST_TIMEOUT);
   });
 
   it('does not fire before the specified ms', () => {

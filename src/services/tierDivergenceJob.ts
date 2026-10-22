@@ -22,8 +22,7 @@
  * to zero.  See docs/runbook.md → "Reindexing" for the procedure.
  */
 
-import { queryPlayers } from '../db';
-import { queryEvents } from '../db';
+import { getEventsCount, queryPlayers } from '../db';
 import { tierForApprovedMilestones } from './tierPromotion';
 import { logger } from '../utils/logger';
 import config from '../config';
@@ -67,9 +66,9 @@ export async function runTierDivergenceCheck(): Promise<void> {
 
   for (const player of players) {
     // Count approved milestones in the events store (off-chain derived value)
-    const approvedCount = queryEvents('milestone_approved').filter(
-      (e) => e.payload.player_id === player.player_id,
-    ).length;
+    const approvedCount = getEventsCount('milestone_approved', {
+      payloadFilter: { player_id: player.player_id },
+    });
 
     const derivedTier = tierForApprovedMilestones(approvedCount);
     const storedTier = player.progress_level as number;

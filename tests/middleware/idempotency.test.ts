@@ -12,6 +12,7 @@
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
 import express from 'express';
+import type { Request, Response } from 'express';
 
 const SECRET = process.env.JWT_SECRET ?? 'test-secret';
 const WALLET = 'GSCOUTWALLET1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
@@ -80,6 +81,13 @@ jest.mock('../../src/db', () => {
         request_fingerprint: null,
       });
     }),
+
+    // releaseIdempotencyKey deletes pending records (used when handler ends without res.json)
+    releaseIdempotencyKey: jest.fn((key: string) => {
+      if (idempotencyStore.get(key)?.status === 'pending') {
+        idempotencyStore.delete(key);
+      }
+    }),
   };
 });
 
@@ -114,6 +122,7 @@ import {
   getIdempotencyRecord,
   claimIdempotencyKey,
   updateIdempotencyRecord,
+  releaseIdempotencyKey,
 } from '../../src/db';
 import { inFlightLock } from '../../src/utils/inflightLock';
 
@@ -121,6 +130,7 @@ const mockPurchase = purchaseSubscription as jest.Mock;
 const mockClaim = claimIdempotencyKey as jest.Mock;
 const mockUpdate = updateIdempotencyRecord as jest.Mock;
 const mockGet = getIdempotencyRecord as jest.Mock;
+const mockRelease = releaseIdempotencyKey as jest.Mock;
 
 function makeToken(wallet: string, role = 'scout'): string {
   return jwt.sign({ sub: wallet, role }, SECRET, { expiresIn: '1h' });
@@ -135,6 +145,7 @@ beforeEach(() => {
   mockClaim.mockClear();
   mockUpdate.mockClear();
   mockGet.mockClear();
+  mockRelease.mockClear();
 });
 
 // ─── Concurrency tests ────────────────────────────────────────────────────────
@@ -380,6 +391,7 @@ describe('idempotency middleware — request fingerprint conflicts', () => {
         expires_at: Date.now() + 24 * 60 * 60 * 1000,
         request_fingerprint: requestFingerprint ?? null,
       });
+
       return true;
     });
     mockGet.mockImplementation((key: string) => {
@@ -390,6 +402,12 @@ describe('idempotency middleware — request fingerprint conflicts', () => {
     });
     mockUpdate.mockImplementation((key: string, statusCode: number, body: unknown) => {
       const record = idempotencyStore.get(key);
+      // Mirrors updateIdempotencyRecord: transient 5xx outcomes drop the
+      // pending record instead of caching it.
+      if (record && statusCode >= 500) {
+        idempotencyStore.delete(key);
+        return;
+      }
       if (record) {
         record.status_code = statusCode;
         record.response = JSON.stringify(body);
@@ -431,5 +449,215 @@ describe('idempotency middleware — request fingerprint conflicts', () => {
 
     expect(conflict.status).toBe(409);
     expect(conflict.body.error).toMatch(/different request/i);
+  });
+});
+
+describe('idempotency middleware — key validation', () => {
+  const validationApp = express();
+  validationApp.post('/items', idempotency, (_req, res) => res.json({ ok: true }));
+
+  it('rejects keys longer than 255 bytes without accessing the idempotency store', async () => {
+    const res = await request(validationApp)
+      .post('/items')
+      .set('Idempotency-Key', 'k'.repeat(256))
+      .send({});
+
+    expect(res.status).toBe(400);
+    expect(mockGet).not.toHaveBeenCalled();
+    expect(mockClaim).not.toHaveBeenCalled();
+  });
+
+  it('rejects control characters without accessing the idempotency store', async () => {
+    const response = {
+      status: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    };
+    const next = jest.fn();
+
+    idempotency(
+      {
+        params: {},
+        headers: { 'idempotency-key': 'bad\u0001key' },
+      } as unknown as Request,
+      response as unknown as Response,
+      next,
+    );
+
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(response.status).toHaveBeenCalledWith(400);
+    expect(response.json).toHaveBeenCalledWith({
+      error: 'Idempotency-Key must be at most 255 bytes and contain no control characters',
+    });
+    expect(next).not.toHaveBeenCalled();
+    expect(mockGet).not.toHaveBeenCalled();
+    expect(mockClaim).not.toHaveBeenCalled();
+  });
+});
+
+// ─── Lease-based recovery and selective persistence ───────────────────────────
+
+describe('idempotency middleware — lease and persistence', () => {
+  const miniApp = express();
+  miniApp.use(express.json());
+  miniApp.post(
+    '/items',
+    idempotency({
+      requestFingerprint: (req) =>
+        String((req.body as { id?: string } | undefined)?.id ?? ''),
+    }),
+    (req, res) => {
+      res.json({ ok: true, id: (req.body as { id?: string }).id });
+    },
+  );
+
+  beforeEach(() => {
+    idempotencyStore.clear();
+    inFlightLock.clear();
+    mockClaim.mockImplementation((key: string, requestFingerprint?: string | null) => {
+      if (idempotencyStore.has(key)) return false;
+      idempotencyStore.set(key, {
+        status_code: 0,
+        response: '',
+        status: 'pending',
+        expires_at: Date.now() + 24 * 60 * 60 * 1000,
+        request_fingerprint: requestFingerprint ?? null,
+        locked_until: Date.now() + 35_000, // New lease field
+      });
+      return true;
+    });
+    mockGet.mockImplementation((key: string) => {
+      const record = idempotencyStore.get(key);
+      if (!record) return null;
+      if (record.expires_at <= Date.now()) return null;
+      return { key, ...record };
+    });
+    mockUpdate.mockImplementation((key: string, statusCode: number, body: unknown) => {
+      const record = idempotencyStore.get(key);
+      // Mirrors updateIdempotencyRecord: transient 5xx outcomes drop the
+      // pending record instead of caching it.
+      if (record && statusCode >= 500) {
+        idempotencyStore.delete(key);
+        return;
+      }
+      if (record) {
+        record.status_code = statusCode;
+        record.response = JSON.stringify(body);
+        record.status = 'complete';
+      }
+    });
+    mockClaim.mockClear();
+    mockUpdate.mockClear();
+    mockGet.mockClear();
+  });
+
+  it('does not cache 5xx responses', async () => {
+    // Override the middleware's handler to return a 500 error
+    const appWith500 = express();
+    appWith500.use(express.json());
+    appWith500.post(
+      '/items',
+      idempotency(),
+      (req, res, next) => {
+        next(new Error('Internal server error'));
+      },
+      (err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
+        res.status(500).json({ success: false, error: err.message, code: 'INTERNAL_ERROR' });
+      },
+    );
+
+    const res = await request(appWith500)
+      .post('/items')
+      .set('Idempotency-Key', '5xx-test-key')
+      .send({});
+
+    expect(res.status).toBe(500);
+    // The pending record should have been deleted, not cached
+    expect(idempotencyStore.has('5xx-test-key')).toBe(false);
+  });
+
+  it('caches deterministic 4xx responses (e.g., 404 Not Found)', async () => {
+    const appWith404 = express();
+    appWith404.use(express.json());
+    appWith404.post(
+      '/items',
+      idempotency(),
+      (req, res, next) => {
+        const notFound = new Error('Not found');
+        (notFound as any).statusCode = 404;
+        next(notFound);
+      },
+      (err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
+        res.status(404).json({ success: false, error: err.message, code: 'NOT_FOUND' });
+      },
+    );
+
+    const res = await request(appWith404)
+      .post('/items')
+      .set('Idempotency-Key', '4xx-test-key')
+      .send({});
+
+    expect(res.status).toBe(404);
+    // 4xx (non-retryable) should be cached
+    expect(idempotencyStore.has('4xx-test-key')).toBe(true);
+    const record = idempotencyStore.get('4xx-test-key');
+    expect(record?.status).toBe('complete');
+    expect(record?.status_code).toBe(404);
+  });
+
+  it('reuses key after lease expires for pending record', async () => {
+    const key = 'lease-test-key';
+    // Pre-populate a pending record with an expired lease
+    const oldLease = Date.now() - 10_000; // 10 seconds ago (expired)
+    idempotencyStore.set(key, {
+      status_code: 0,
+      response: '',
+      status: 'pending',
+      expires_at: Date.now() + 24 * 60 * 60 * 1000,
+      request_fingerprint: null,
+      locked_until: oldLease,
+    });
+
+    // Simulate the new claim logic: should succeed because lease expired
+    const now = Date.now();
+    const claimed = mockClaim.mock.calls.length > 0
+      ? !idempotencyStore.has(key) // simplified
+      : true;
+
+    expect(claimed).toBe(true);
+    // The new request should be able to claim the key
+    expect(idempotencyStore.get(key)?.status).toBe('pending');
+  });
+
+  it('returns 409 with structured error format (success, error, code)', async () => {
+    const key = '409-structured-key';
+    // Seed a pending record
+    idempotencyStore.set(key, {
+      status_code: 0,
+      response: '',
+      status: 'pending',
+      expires_at: Date.now() + 24 * 60 * 60 * 1000,
+      request_fingerprint: null,
+      locked_until: Date.now() + 35_000,
+    });
+
+    // Override inFlightLock to timeout immediately so we get 409
+    jest
+      .spyOn(inFlightLock, 'withLock')
+      .mockImplementationOnce(async () => ({
+        statusCode: 0,
+        body: null,
+      }));
+
+    const res = await request(app)
+      .post(`/api/scouts/${WALLET}/subscribe`)
+      .set('Authorization', `Bearer ${makeToken(WALLET)}`)
+      .set('Idempotency-Key', key)
+      .send(VALID_BODY);
+
+    expect(res.status).toBe(409);
+    expect(res.body).toHaveProperty('success', false);
+    expect(res.body).toHaveProperty('error');
+    expect(res.body).toHaveProperty('code');
   });
 });

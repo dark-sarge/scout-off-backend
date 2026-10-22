@@ -104,6 +104,12 @@ export type PostgresSslOption =
   /** Disable SSL entirely (local / private-network Postgres without TLS). */
   | false;
 
+export interface PostgresTimeoutOptions {
+  statementTimeoutMs: number;
+  queryTimeoutMs: number;
+  idleInTransactionSessionTimeoutMs: number;
+}
+
 /**
  * Translates the app's SQLite-style `?` positional placeholders into
  * PostgreSQL's `$1, $2, ...` placeholders, so query SQL can be shared
@@ -138,8 +144,23 @@ export function translatePlaceholders(sql: string): string {
 export class PostgresDriver implements DbDriver {
   private pool: Pool;
 
-  constructor(connectionString: string, ssl: PostgresSslOption = false, poolSize = 10) {
-    const poolConfig: PoolConfig = { connectionString, max: poolSize };
+  constructor(
+    connectionString: string,
+    ssl: PostgresSslOption = false,
+    poolSize = 10,
+    timeouts: PostgresTimeoutOptions = {
+      statementTimeoutMs: 25000,
+      queryTimeoutMs: 30000,
+      idleInTransactionSessionTimeoutMs: 60000,
+    },
+  ) {
+    const poolConfig: PoolConfig = {
+      connectionString,
+      max: poolSize,
+      statement_timeout: timeouts.statementTimeoutMs,
+      query_timeout: timeouts.queryTimeoutMs,
+      idle_in_transaction_session_timeout: timeouts.idleInTransactionSessionTimeoutMs,
+    };
 
     if (ssl === true) {
       // Full certificate verification — the default secure mode for production.

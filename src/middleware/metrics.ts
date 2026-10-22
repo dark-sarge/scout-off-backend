@@ -225,6 +225,18 @@ export function getWebhookDeliveryMetrics(): Record<WebhookDeliveryStatus, numbe
   return { ...webhookDeliveryStore };
 }
 
+// ─── Evidence download rejections (#1331) ─────────────────────────────────────
+
+const evidenceRejectionStore: Record<string, number> = {};
+
+export function recordEvidenceRejection(reason: string): void {
+  evidenceRejectionStore[reason] = (evidenceRejectionStore[reason] ?? 0) + 1;
+}
+
+export function getEvidenceRejectionMetrics(): Record<string, number> {
+  return { ...evidenceRejectionStore };
+}
+
 // ─── SSE active connections gauge ─────────────────────────────────────────────
 
 /** In-memory gauge for currently open SSE connections. */
@@ -532,6 +544,12 @@ export function serializeMetrics(extras: SerializeMetricsExtras = {}): string {
   lines.push(`webhook_delivery_total{status="success"} ${webhookDelivery.success}`);
   lines.push(`webhook_delivery_total{status="failure"} ${webhookDelivery.failure}`);
   lines.push(`webhook_delivery_total{status="dead_letter"} ${webhookDelivery.dead_letter}`);
+
+  lines.push('# HELP evidence_download_rejected_total Evidence downloads rejected, by reason');
+  lines.push('# TYPE evidence_download_rejected_total counter');
+  for (const [reason, count] of Object.entries(getEvidenceRejectionMetrics())) {
+    lines.push(`evidence_download_rejected_total{reason="${reason}"} ${count}`);
+  }
 
   // SSE active connections gauge.
   if (extras.sseConnectionsActive !== undefined) {

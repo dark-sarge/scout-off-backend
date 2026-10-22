@@ -86,15 +86,23 @@ router.get('/yaml', (_req: Request, res: Response) => {
  * @response 200 Swagger UI HTML page (text/html)
  * @response 501 { success: false, error: string } - swagger-ui-dist not installed
  */
-router.get('/ui', (_req: Request, res: Response) => {
-  try {
-    require.resolve('swagger-ui-dist/swagger-ui.css');
-  } catch {
-    res.status(501).json({
-      success: false,
-      error: 'swagger-ui-dist is not installed. Run: npm install swagger-ui-dist',
-    });
-    return;
+router.get('/ui', (req: Request, res: Response) => {
+  const assetRoot = req.baseUrl;
+  const assetDir = path.dirname(require.resolve('swagger-ui-dist/swagger-ui.css'));
+  const cssPath = path.join(assetDir, 'swagger-ui.css');
+  const bundlePath = path.join(assetDir, 'swagger-ui-bundle.js');
+
+  const assetFiles = [
+    ['swagger-ui.css', cssPath],
+    ['swagger-ui-bundle.js', bundlePath],
+  ];
+
+  for (const [name, filePath] of assetFiles) {
+    const resolvedPath = path.resolve(filePath);
+    if (!resolvedPath.startsWith(path.resolve(assetDir))) {
+      res.status(500).json({ success: false, error: `Invalid asset path for ${name}` });
+      return;
+    }
   }
 
   const html = `<!DOCTYPE html>
@@ -102,14 +110,14 @@ router.get('/ui', (_req: Request, res: Response) => {
 <head>
   <meta charset="UTF-8" />
   <title>ScoutOff API Docs</title>
-  <link rel="stylesheet" href="/api/docs/ui/swagger-ui.css" />
+  <link rel="stylesheet" href="${assetRoot}/swagger-ui.css" />
 </head>
 <body>
   <div id="swagger-ui"></div>
-  <script src="/api/docs/ui/swagger-ui-bundle.js"></script>
+  <script src="${assetRoot}/swagger-ui-bundle.js"></script>
   <script>
     SwaggerUIBundle({
-      url: "/api/docs",
+      url: "${req.baseUrl}",
       dom_id: "#swagger-ui",
       presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
       layout: "BaseLayout",
@@ -120,6 +128,28 @@ router.get('/ui', (_req: Request, res: Response) => {
 </html>`;
 
   res.type('html').send(html);
+});
+
+/**
+ * GET /api/docs/swagger-ui.css
+ * Serves the Swagger UI stylesheet from swagger-ui-dist for the /ui page.
+ *
+ * @response 200 Swagger UI stylesheet (text/css)
+ */
+router.get('/swagger-ui.css', (_req: Request, res: Response) => {
+  const cssPath = require.resolve('swagger-ui-dist/swagger-ui.css');
+  res.type('text/css').sendFile(cssPath);
+});
+
+/**
+ * GET /api/docs/swagger-ui-bundle.js
+ * Serves the Swagger UI JavaScript bundle from swagger-ui-dist for the /ui page.
+ *
+ * @response 200 Swagger UI JavaScript bundle (text/javascript)
+ */
+router.get('/swagger-ui-bundle.js', (_req: Request, res: Response) => {
+  const jsPath = require.resolve('swagger-ui-dist/swagger-ui-bundle.js');
+  res.type('text/javascript').sendFile(jsPath);
 });
 
 export default router;

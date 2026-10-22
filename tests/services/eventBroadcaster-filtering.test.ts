@@ -39,10 +39,12 @@ interface MockSubscriber extends SseSubscriber {
 function createMockSubscriber(
   wallet: string,
   filter?: SseFilterCriteria,
+  playerId?: string,
 ): MockSubscriber {
   const sentEvents: BroadcastEvent[] = [];
   return {
     wallet,
+    playerId,
     filter,
     sentEvents,
     send(event: BroadcastEvent) {
@@ -59,13 +61,13 @@ describe('EventBroadcaster: eventTypes filter', () => {
   it('delivers only milestone_approved when eventTypes filter includes only milestone_approved', () => {
     const sub = createMockSubscriber(WALLET_A, {
       eventTypes: new Set(['milestone_approved']),
-    });
+    }, PLAYER_1);
     broadcaster.subscribe(sub);
 
     // Send events of different types
     const milestoneEvent: BroadcastEvent = {
       type: 'milestone_approved',
-      payload: { player_id: WALLET_A },
+      payload: { player_id: PLAYER_1 },
     };
     const scoutEvent: BroadcastEvent = {
       type: 'scout_subscribed',
@@ -82,12 +84,12 @@ describe('EventBroadcaster: eventTypes filter', () => {
   it('delivers only scout_subscribed and contact_unlocked when filter specifies both', () => {
     const sub = createMockSubscriber(WALLET_A, {
       eventTypes: new Set(['scout_subscribed', 'contact_unlocked']),
-    });
+    }, PLAYER_1);
     broadcaster.subscribe(sub);
 
     const milestoneEvent: BroadcastEvent = {
       type: 'milestone_approved',
-      payload: { player_id: WALLET_A },
+      payload: { player_id: PLAYER_1 },
     };
     const scoutSubEvent: BroadcastEvent = {
       type: 'scout_subscribed',
@@ -110,12 +112,12 @@ describe('EventBroadcaster: eventTypes filter', () => {
     // Empty eventTypes set means no type filtering (receives all types)
     const sub = createMockSubscriber(WALLET_A, {
       eventTypes: new Set([]),
-    });
+    }, PLAYER_1);
     broadcaster.subscribe(sub);
 
     const milestoneEvent: BroadcastEvent = {
       type: 'milestone_approved',
-      payload: { player_id: WALLET_A },
+      payload: { player_id: PLAYER_1 },
     };
     const scoutSubEvent: BroadcastEvent = {
       type: 'scout_subscribed',
@@ -133,19 +135,19 @@ describe('EventBroadcaster: eventTypes filter', () => {
   it('respects wallet relevance even with type filter (no cross-tenant leakage)', () => {
     const sub = createMockSubscriber(WALLET_A, {
       eventTypes: new Set(['milestone_approved']),
-    });
+    }, PLAYER_1);
     broadcaster.subscribe(sub);
 
     // Event for WALLET_A
     const relevantEvent: BroadcastEvent = {
       type: 'milestone_approved',
-      payload: { player_id: WALLET_A },
+      payload: { player_id: PLAYER_1 },
     };
 
     // Event for WALLET_B (not relevant to subscriber)
     const irrelevantEvent: BroadcastEvent = {
       type: 'milestone_approved',
-      payload: { player_id: WALLET_B },
+      payload: { player_id: PLAYER_2 },
     };
 
     broadcaster.broadcast(relevantEvent);
@@ -194,7 +196,7 @@ describe('EventBroadcaster: playerId filter', () => {
     const sub = createMockSubscriber(PLAYER_1, {
       eventTypes: new Set([]),
       playerId: PLAYER_1,
-    });
+    }, PLAYER_1);
     broadcaster.subscribe(sub);
 
     // PLAYER_1 in player_id field
@@ -345,11 +347,11 @@ describe('EventBroadcaster: combined eventTypes + playerId filters', () => {
 
 describe('EventBroadcaster: wildcard (no filter)', () => {
   it('delivers all wallet-relevant events when filter is undefined', () => {
-    const sub = createMockSubscriber(WALLET_A); // No filter
+    const sub = createMockSubscriber(WALLET_A, undefined, PLAYER_1); // No event filter
     broadcaster.subscribe(sub);
 
     const events: BroadcastEvent[] = [
-      { type: 'milestone_approved', payload: { player_id: WALLET_A } },
+      { type: 'milestone_approved', payload: { player_id: PLAYER_1 } },
       { type: 'scout_subscribed', payload: { scout: WALLET_A } },
       { type: 'contact_unlocked', payload: { scout: WALLET_A } },
       { type: 'trial_offer_logged', payload: { scout: WALLET_A } },
@@ -362,17 +364,17 @@ describe('EventBroadcaster: wildcard (no filter)', () => {
   });
 
   it('still respects wallet relevance in wildcard mode', () => {
-    const sub = createMockSubscriber(WALLET_A); // No filter
+    const sub = createMockSubscriber(WALLET_A, undefined, PLAYER_1); // No event filter
     broadcaster.subscribe(sub);
 
     const relevantEvent: BroadcastEvent = {
       type: 'milestone_approved',
-      payload: { player_id: WALLET_A },
+      payload: { player_id: PLAYER_1 },
     };
 
     const irrelevantEvent: BroadcastEvent = {
       type: 'milestone_approved',
-      payload: { player_id: WALLET_B },
+      payload: { player_id: PLAYER_2 },
     };
 
     broadcaster.broadcast(relevantEvent);
@@ -386,19 +388,53 @@ describe('EventBroadcaster: wildcard (no filter)', () => {
     const sub = createMockSubscriber(WALLET_A, {
       eventTypes: new Set([]),
       playerId: undefined,
-    });
+    }, PLAYER_1);
     broadcaster.subscribe(sub);
 
     const events: BroadcastEvent[] = [
-      { type: 'milestone_approved', payload: { player_id: WALLET_A } },
+      { type: 'milestone_approved', payload: { player_id: PLAYER_1 } },
       { type: 'player_registered', payload: { wallet: WALLET_A } },
-      { type: 'trial_offer_accepted', payload: { player_id: WALLET_A } },
+      { type: 'trial_offer_accepted', payload: { player_id: PLAYER_1 } },
     ];
 
     events.forEach((e) => broadcaster.broadcast(e));
 
     // All should arrive (empty set = no type filtering)
     expect(sub.sentEvents).toEqual(events);
+  });
+});
+
+describe('EventBroadcaster: player ownership relevance', () => {
+  it('matches player cuid2 IDs to the authenticated wallet owner', () => {
+    const sub = createMockSubscriber(WALLET_A, undefined, PLAYER_1);
+    broadcaster.subscribe(sub);
+
+    const ownedEvents: BroadcastEvent[] = [
+      { type: 'milestone_approved', payload: { player_id: PLAYER_1 } },
+      { type: 'trial_offer_logged', payload: { player_id: PLAYER_1, scout: WALLET_B } },
+      { type: 'milestone_submitted', payload: { player_id: PLAYER_1, validator: WALLET_B } },
+    ];
+    const otherPlayerEvent: BroadcastEvent = {
+      type: 'milestone_approved',
+      payload: { player_id: PLAYER_2 },
+    };
+
+    ownedEvents.forEach((event) => broadcaster.broadcast(event));
+    broadcaster.broadcast(otherPlayerEvent);
+
+    expect(sub.sentEvents).toEqual(ownedEvents);
+  });
+
+  it('does not treat a player ID as a wallet when no owner mapping is available', () => {
+    const sub = createMockSubscriber(WALLET_A);
+    broadcaster.subscribe(sub);
+
+    broadcaster.broadcast({
+      type: 'milestone_approved',
+      payload: { player_id: WALLET_A },
+    });
+
+    expect(sub.sentEvents).toEqual([]);
   });
 });
 
@@ -411,7 +447,7 @@ describe('EventBroadcaster: cross-subscriber isolation', () => {
     // Sub A: milestone_approved only
     const subA = createMockSubscriber(WALLET_A, {
       eventTypes: new Set(['milestone_approved']),
-    });
+    }, PLAYER_1);
 
     // Sub B: scout_subscribed only (different wallet)
     const subB = createMockSubscriber(WALLET_B, {
@@ -423,7 +459,7 @@ describe('EventBroadcaster: cross-subscriber isolation', () => {
 
     const milestoneEventA: BroadcastEvent = {
       type: 'milestone_approved',
-      payload: { player_id: WALLET_A },
+      payload: { player_id: PLAYER_1 },
     };
 
     const scoutEventB: BroadcastEvent = {
@@ -445,7 +481,7 @@ describe('EventBroadcaster: cross-subscriber isolation', () => {
     // Both subscribers are WALLET_A but with different type filters
     const subType1 = createMockSubscriber(WALLET_A, {
       eventTypes: new Set(['milestone_approved']),
-    });
+    }, PLAYER_1);
 
     const subType2 = createMockSubscriber(WALLET_A, {
       eventTypes: new Set(['scout_subscribed']),
@@ -456,7 +492,7 @@ describe('EventBroadcaster: cross-subscriber isolation', () => {
 
     const milestoneEvent: BroadcastEvent = {
       type: 'milestone_approved',
-      payload: { player_id: WALLET_A },
+      payload: { player_id: PLAYER_1 },
     };
 
     const scoutEvent: BroadcastEvent = {
@@ -481,12 +517,12 @@ describe('EventBroadcaster: cross-subscriber isolation', () => {
 
 describe('EventBroadcaster: unsubscribe and event delivery', () => {
   it('unsubscribed subscribers do not receive events', () => {
-    const sub = createMockSubscriber(WALLET_A);
+    const sub = createMockSubscriber(WALLET_A, undefined, PLAYER_1);
     broadcaster.subscribe(sub);
 
     const event1: BroadcastEvent = {
       type: 'milestone_approved',
-      payload: { player_id: WALLET_A },
+      payload: { player_id: PLAYER_1 },
     };
 
     broadcaster.broadcast(event1);

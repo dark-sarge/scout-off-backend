@@ -52,6 +52,7 @@ describe.each(stores)('rateLimit middleware ($name)', ({ create }) => {
     const { req, res, next } = makeReqRes(ip);
     await mw(req, res, next);
     expect(res.status).toHaveBeenCalledWith(429);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'RATE_LIMITED' }));
     expect(next).not.toHaveBeenCalled();
   });
 
@@ -139,6 +140,7 @@ describe.each(stores)('walletRateLimit middleware ($name)', ({ create }) => {
     const res = {
       status: jest.fn().mockReturnThis(),
       json: jest.fn().mockReturnThis(),
+      set: jest.fn().mockReturnThis(),
     } as unknown as Response;
     const next = jest.fn() as NextFunction;
     return { req, res, next };
@@ -164,6 +166,10 @@ describe.each(stores)('walletRateLimit middleware ($name)', ({ create }) => {
     const { req, res, next } = makeReqResWithWallet(wallet);
     await mw(req, res, next);
     expect(res.status).toHaveBeenCalledWith(429);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'RATE_LIMITED' }));
+    expect(res.set).toHaveBeenCalledWith('Retry-After', expect.any(String));
+    const retryAfter = Number((res.set as jest.Mock).mock.calls[0][1]);
+    expect(retryAfter).toBeGreaterThan(0);
     expect(next).not.toHaveBeenCalled();
   });
 

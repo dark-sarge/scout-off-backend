@@ -124,6 +124,24 @@ function main() {
     process.exit(1);
   }
 
+  const operationIds = new Map();
+  for (const [openApiPath, pathItem] of Object.entries(spec.paths)) {
+    for (const [method, operation] of Object.entries(pathItem)) {
+      if (!operation || typeof operation !== 'object' || !operation.operationId) continue;
+      const locations = operationIds.get(operation.operationId) || [];
+      locations.push(`${method.toUpperCase()} ${openApiPath}`);
+      operationIds.set(operation.operationId, locations);
+    }
+  }
+  const duplicateOperationIds = [...operationIds].filter(([, locations]) => locations.length > 1);
+  if (duplicateOperationIds.length > 0) {
+    console.error(
+      '[validate-openapi] operationId values must be unique: ' +
+      duplicateOperationIds.map(([id, locations]) => `${id} (${locations.join(', ')})`).join('; '),
+    );
+    process.exit(1);
+  }
+
   // ── Step 3: Regenerate from the canonical source and diff ─────────────────
   // This is the check that actually enforces "one source of truth": it does
   // not compare the spec against another hand-maintained file, it compares

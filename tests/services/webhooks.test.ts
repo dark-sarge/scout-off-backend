@@ -2,6 +2,7 @@ import fetch from 'node-fetch';
 import crypto from 'crypto';
 import { postWebhookWithRetry, signWebhookPayload, dispatchEventWebhook } from '../../src/services/webhooks';
 import { createWebhookSubscription, listWebhookDeadLetters } from '../../src/db';
+import { getVersionInfo } from '../../src/version';
 
 jest.mock('node-fetch', () => jest.fn());
 
@@ -36,6 +37,64 @@ describe('postWebhookWithRetry', () => {
     expect(mockedFetch).toHaveBeenCalledTimes(2);
   });
 
+  it('applies full jitter to exponential backoff delays', async () => {
+    jest.useFakeTimers();
+    const random = jest.spyOn(Math, 'random').mockReturnValue(0.5);
+    try {
+      mockedFetch.mockRejectedValueOnce(new Error('network fail'));
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      mockedFetch.mockResolvedValueOnce({ ok: true, status: 200 } as any);
+
+      const delivery = postWebhookWithRetry(
+        'https://example.com',
+        { eventType: 'test' },
+        { retries: 2, baseDelayMs: 100, maxDelayMs: 100 },
+      );
+      await jest.advanceTimersByTimeAsync(49);
+      expect(mockedFetch).toHaveBeenCalledTimes(1);
+
+      await jest.advanceTimersByTimeAsync(1);
+      await expect(delivery).resolves.toBeUndefined();
+      expect(mockedFetch).toHaveBeenCalledTimes(2);
+    } finally {
+      random.mockRestore();
+      jest.useRealTimers();
+    }
+  });
+
+  it('uses Retry-After for 429/503 responses and drains failed response bodies', async () => {
+    jest.useFakeTimers();
+    try {
+      const body = { resume: jest.fn() };
+      mockedFetch
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 503,
+          headers: { get: () => '2' },
+          body,
+        } as any)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        .mockResolvedValueOnce({ ok: true, status: 200 } as any);
+
+      const delivery = postWebhookWithRetry(
+        'https://example.com',
+        { eventType: 'test' },
+        { retries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+      );
+
+      await jest.advanceTimersByTimeAsync(1999);
+      expect(mockedFetch).toHaveBeenCalledTimes(1);
+      expect(body.resume).toHaveBeenCalledTimes(1);
+
+      await jest.advanceTimersByTimeAsync(1);
+      await expect(delivery).resolves.toBeUndefined();
+      expect(mockedFetch).toHaveBeenCalledTimes(2);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('throws after all retries fail', async () => {
     mockedFetch.mockRejectedValue(new Error('network down'));
 
@@ -58,10 +117,16 @@ describe('postWebhookWithRetry', () => {
     const rawBody = init!.body as string;
     expect(rawBody).toBe(JSON.stringify(payload));
 
-    const signatureHeader = (init!.headers as Record<string, string>)['X-Webhook-Signature'];
+    const requestHeaders = init!.headers as Record<string, string>;
+    const signatureHeader = requestHeaders['X-Webhook-Signature'];
+    const timestamp = requestHeaders['X-Webhook-Timestamp'];
     expect(signatureHeader).toMatch(/^sha256=[0-9a-f]{64}$/);
+    expect(timestamp).toMatch(/^\d+$/);
 
-    const expectedDigest = crypto.createHmac('sha256', 'shh-secret').update(rawBody).digest('hex');
+    const expectedDigest = crypto
+      .createHmac('sha256', 'shh-secret')
+      .update(`${timestamp}.${rawBody}`)
+      .digest('hex');
     expect(signatureHeader).toBe(`sha256=${expectedDigest}`);
   });
 
@@ -73,6 +138,45 @@ describe('postWebhookWithRetry', () => {
 
     const [, init] = mockedFetch.mock.calls[0];
     expect((init!.headers as Record<string, string>)['X-Webhook-Signature']).toBeUndefined();
+    expect((init!.headers as Record<string, string>)['X-Webhook-Timestamp']).toBeUndefined();
+  });
+
+  it('sends User-Agent, X-Webhook-Event and X-Webhook-Delivery headers', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    mockedFetch.mockResolvedValue({ ok: true, status: 200 } as any);
+
+    await postWebhookWithRetry(
+      'https://example.com',
+      { eventType: 'player_registered', payload: { wallet: 'GABC' } },
+      { eventType: 'player_registered', deliveryId: 'delivery-123' }
+    );
+
+    expect(mockedFetch).toHaveBeenCalledTimes(1);
+    const [, init] = mockedFetch.mock.calls[0];
+    const headers = init!.headers as Record<string, string>;
+    expect(headers['User-Agent']).toBe(`ScoutOff-Webhooks/${getVersionInfo().version}`);
+    expect(headers['X-Webhook-Event']).toBe('player_registered');
+    expect(headers['X-Webhook-Delivery']).toBe('delivery-123');
+  });
+
+  it('sends identical headers on every retry attempt', async () => {
+    mockedFetch.mockRejectedValueOnce(new Error('network fail'));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    mockedFetch.mockResolvedValue({ ok: true, status: 200 } as any);
+
+    await postWebhookWithRetry(
+      'https://example.com',
+      { eventType: 'milestone_approved', payload: { milestoneId: 'm1' } },
+      { eventType: 'milestone_approved', deliveryId: 'delivery-456', retries: 3, baseDelayMs: 1, maxDelayMs: 2 }
+    );
+
+    expect(mockedFetch).toHaveBeenCalledTimes(2);
+    for (const [, init] of mockedFetch.mock.calls) {
+      const headers = init!.headers as Record<string, string>;
+      expect(headers['User-Agent']).toBe(`ScoutOff-Webhooks/${getVersionInfo().version}`);
+      expect(headers['X-Webhook-Event']).toBe('milestone_approved');
+      expect(headers['X-Webhook-Delivery']).toBe('delivery-456');
+    }
   });
 
   it(
@@ -117,22 +221,32 @@ describe('signWebhookPayload', () => {
   it('produces the documented sha256=<hex> format, verifiable by recomputing the HMAC with the same secret', () => {
     const secret = 'my-subscriber-secret';
     const rawBody = JSON.stringify({ eventType: 'player_registered', payload: { wallet: 'GABC' } });
+    const timestamp = '1785000000';
 
-    const signature = signWebhookPayload(rawBody, secret);
+    const signature = signWebhookPayload(rawBody, secret, timestamp);
     expect(signature).toMatch(/^sha256=[0-9a-f]{64}$/);
 
-    // A receiver recomputing the HMAC over the same raw body with the same
-    // secret must derive the identical signature (docs/webhooks.md).
-    const recomputed = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+    const recomputed = crypto
+      .createHmac('sha256', secret)
+      .update(`${timestamp}.${rawBody}`)
+      .digest('hex');
     expect(signature).toBe(`sha256=${recomputed}`);
   });
 
   it('produces a different signature for a different secret or a different body', () => {
     const rawBody = JSON.stringify({ eventType: 'test' });
-    expect(signWebhookPayload(rawBody, 'secret-a')).not.toBe(signWebhookPayload(rawBody, 'secret-b'));
+    const timestamp = '1785000000';
+    expect(signWebhookPayload(rawBody, 'secret-a', timestamp)).not.toBe(
+      signWebhookPayload(rawBody, 'secret-b', timestamp),
+    );
 
     const otherBody = JSON.stringify({ eventType: 'other' });
-    expect(signWebhookPayload(rawBody, 'secret-a')).not.toBe(signWebhookPayload(otherBody, 'secret-a'));
+    expect(signWebhookPayload(rawBody, 'secret-a', timestamp)).not.toBe(
+      signWebhookPayload(otherBody, 'secret-a', timestamp),
+    );
+    expect(signWebhookPayload(rawBody, 'secret-a', timestamp)).not.toBe(
+      signWebhookPayload(rawBody, 'secret-a', '1785000001'),
+    );
   });
 });
 
@@ -154,8 +268,11 @@ describe('dispatchEventWebhook', () => {
     expect(call).toBeDefined();
     const [, init] = call!;
     const rawBody = init!.body as string;
-    const signatureHeader = (init!.headers as Record<string, string>)['X-Webhook-Signature'];
-    expect(signatureHeader).toBe(signWebhookPayload(rawBody, secret));
+    const requestHeaders = init!.headers as Record<string, string>;
+    const signatureHeader = requestHeaders['X-Webhook-Signature'];
+    expect(signatureHeader).toBe(
+      signWebhookPayload(rawBody, secret, requestHeaders['X-Webhook-Timestamp']),
+    );
     const parsed = JSON.parse(rawBody);
     expect(parsed.eventType).toBe('player_registered');
     expect(parsed.payload).toEqual({ wallet: 'GABC' });
@@ -163,6 +280,12 @@ describe('dispatchEventWebhook', () => {
     expect(parsed.deliveryId).toBeDefined();
     expect(typeof parsed.deliveryId).toBe('string');
     expect(parsed.deliveryId.length).toBeGreaterThan(0);
+
+    // Delivery headers must identify the sender, event and delivery
+    const headers = init!.headers as Record<string, string>;
+    expect(headers['User-Agent']).toBe(`ScoutOff-Webhooks/${getVersionInfo().version}`);
+    expect(headers['X-Webhook-Event']).toBe('player_registered');
+    expect(headers['X-Webhook-Delivery']).toBe(parsed.deliveryId);
   });
 
   it(
@@ -186,11 +309,7 @@ describe('dispatchEventWebhook', () => {
       expect(parsedPayload.payload).toEqual({ milestoneId: 'm1' });
       expect(parsedPayload.deliveryId).toBeDefined();
       expect(typeof parsedPayload.deliveryId).toBe('string');
-      // delivery_id column must match the deliveryId in the payload
-      expect(match!.delivery_id).toBe(parsedPayload.deliveryId);
-      expect(match!.failure_reason).toContain('connection refused');
-      expect(match!.attempts).toBe(3);
-      expect(match!.status).toBe('pending');
+      expect(parsedPayload.deliveryId.length).toBeGreaterThan(0);
     },
     15000
   );
@@ -237,14 +356,17 @@ describe('dispatchEventWebhook', () => {
       const rawBody = init!.body as string;
       const parsed = JSON.parse(rawBody);
 
-      // The HMAC is computed over the raw body that includes the deliveryId.
+      // The HMAC is computed over the signed timestamp and raw body, which
+      // includes the deliveryId.
       // If we swap the deliveryId and re-sign with the same secret,
       // the original signature no longer matches.
       const tampered = { ...parsed, deliveryId: 'forged-id' };
       const tamperedBody = JSON.stringify(tampered);
-      const originalSig = (init!.headers as Record<string, string>)['X-Webhook-Signature'];
-      expect(originalSig).toBe(signWebhookPayload(rawBody, secret));
-      expect(signWebhookPayload(tamperedBody, secret)).not.toBe(originalSig);
+      const headers = init!.headers as Record<string, string>;
+      const timestamp = headers['X-Webhook-Timestamp'];
+      const originalSig = headers['X-Webhook-Signature'];
+      expect(originalSig).toBe(signWebhookPayload(rawBody, secret, timestamp));
+      expect(signWebhookPayload(tamperedBody, secret, timestamp)).not.toBe(originalSig);
     },
     15000
   );

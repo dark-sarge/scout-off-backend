@@ -39,3 +39,57 @@ function sanitizeLogArg(arg: unknown): unknown {
   }
   return arg;
 }
+
+/**
+ * Extracts a human-readable message and stack from an arbitrary rejection
+ * reason or thrown value so process-level handlers can log it consistently.
+ */
+export function describeError(reason: unknown): { message: string; stack?: string } {
+  if (reason instanceof Error) {
+    return { message: reason.message, stack: reason.stack };
+  }
+  if (typeof reason === 'string') {
+    return { message: reason };
+  }
+  try {
+    return { message: JSON.stringify(reason) };
+  } catch {
+    return { message: String(reason) };
+  }
+}
+
+/**
+ * Registers process-level handlers for unhandled rejections and uncaught
+ * exceptions.  Kept idempotent so repeated imports (e.g. in tests) do not
+ * stack duplicate listeners.  Returns a disposer that removes the handlers.
+ */
+export function registerProcessErrorHandlers(options: {
+  onUncaughtException: (reason: unknown) => void;
+  exitOnUnhandledRejection?: boolean;
+  onUnhandledRejection?: (reason: unknown) => void;
+}): () => void {
+  const { onUncaughtException, exitOnUnhandledRejection = false, onUnhandledRejection } = options;
+
+  const rejectionHandler = (reason: unknown) => {
+    const { message, stack } = describeError(reason);
+    logger.error(`unhandledRejection: ${message}`, stack ?? '');
+    onUnhandledRejection?.(reason);
+    if (exitOnUnhandledRejection) {
+      process.exitCode = 1;
+    }
+  };
+
+  const exceptionHandler = (err: unknown) => {
+    const { message, stack } = describeError(err);
+    logger.critical(`uncaughtException: ${message}`, stack ?? '');
+    onUncaughtException(err);
+  };
+
+  process.on('unhandledRejection', rejectionHandler);
+  process.on('uncaughtException', exceptionHandler);
+
+  return () => {
+    process.off('unhandledRejection', rejectionHandler);
+    process.off('uncaughtException', exceptionHandler);
+  };
+}

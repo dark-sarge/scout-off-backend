@@ -1,9 +1,25 @@
-import { getDb, queryEvents, fetchLastIndexedLedger, persistLastIndexedLedger, insertOrUpdatePlayer, updatePlayerProgress, getPlayerById, queryPlayers, rollbackEventsFromLedger } from '../../src/db';
-import { normalizeEventId, normalizePayload } from '../../src/services/indexer';
+import {
+  insertOrUpdatePlayer,
+  updatePlayerProgress,
+  getPlayerById,
+  getPlayerByOnChainId,
+  getPlayersMissingOnChainId,
+  setPlayerOnChainId,
+  queryPlayers,
+} from '../../src/db';
+import { normalizeEventId, normalizePayload, normalizeSorobanEvent } from '../../src/services/indexer';
+import {
+  countEvents,
+  dbAll,
+  dbRun,
+  fetchLastIndexedLedgerTest,
+  insertEvent,
+  persistLastIndexedLedgerTest,
+} from '../helpers/db';
 
 describe('indexer', () => {
-  it('returns empty array when no events exist for a type', () => {
-    const events = queryEvents('player_registered');
+  it('returns empty array when no events exist for a type', async () => {
+    const events = await dbAll('SELECT * FROM events WHERE type = ?', ['player_registered']);
     expect(Array.isArray(events)).toBe(true);
   });
 
@@ -25,6 +41,88 @@ describe('indexer', () => {
 
     it('returns empty object for empty input', () => {
       expect(normalizePayload({})).toEqual({});
+    });
+  });
+
+  describe('normalizeSorobanEvent', () => {
+    it('decodes player_rg topics and positional registration data', () => {
+      const { Address, Keypair, nativeToScVal } = require('@stellar/stellar-sdk');
+      const wallet = Keypair.random().publicKey();
+      const event = normalizeSorobanEvent({
+        topic: [
+          nativeToScVal('player_rg', { type: 'symbol' }),
+          Address.fromString(wallet).toScVal(),
+        ],
+        value: nativeToScVal([7n, 'ipfs://meta', 'forward', 'europe']),
+      });
+
+      expect(event).toEqual({
+        type: 'player_registered',
+        payload: {
+          player_id: '7',
+          on_chain_player_id: '7',
+          wallet,
+          metadata_uri: 'ipfs://meta',
+          position: 'forward',
+          region: 'europe',
+        },
+      });
+    });
+
+    it('extracts the indexed player ID from token events', () => {
+      const { nativeToScVal } = require('@stellar/stellar-sdk');
+      const event = normalizeSorobanEvent({
+        topic: [
+          nativeToScVal('tok_buy', { type: 'symbol' }),
+          nativeToScVal(7n, { type: 'u64' }),
+        ],
+        value: nativeToScVal([7n, 10]),
+      });
+
+      expect(event.type).toBe('token_bought');
+      expect(event.payload.player_id).toBe('7');
+      expect(event.payload.on_chain_player_id).toBe('7');
+    });
+
+    it('decodes subscription contact unlocks from the value tuple', () => {
+      const { Address, Keypair, nativeToScVal } = require('@stellar/stellar-sdk');
+      const scout = Keypair.random().publicKey();
+      const event = normalizeSorobanEvent({
+        topic: [nativeToScVal('contact_unlocked', { type: 'symbol' })],
+        value: nativeToScVal([Address.fromString(scout), 12n]),
+      });
+
+      expect(event).toEqual({
+        type: 'contact_unlocked',
+        payload: {
+          scout,
+          player_id: '12',
+          on_chain_player_id: '12',
+        },
+      });
+    });
+
+    it('keeps connection creation out of the paid contact-unlock event stream', () => {
+      const { Address, Keypair, nativeToScVal } = require('@stellar/stellar-sdk');
+      const scout = Keypair.random().publicKey();
+      const event = normalizeSorobanEvent({
+        topic: [
+          nativeToScVal('contact_unlocked', { type: 'symbol' }),
+          Address.fromString(scout).toScVal(),
+          nativeToScVal(12n, { type: 'u64' }),
+        ],
+        value: nativeToScVal(['direct']),
+      });
+
+      expect(event).toEqual({
+        type: 'connection_created',
+        payload: {
+          scout,
+          player_id: '12',
+          connection_type: 'direct',
+          on_chain_player_id: '12',
+        },
+      });
     });
   });
 
@@ -78,6 +176,20 @@ describe('player table helpers', () => {
     expect(await getPlayerById('nonexistent-player-xyz')).toBeNull();
   });
 
+  it('stores and looks up a confirmed on-chain ID without replacing the API ID', async () => {
+    const apiPlayerId = `mapping-test-${Math.random().toString(36).slice(2)}`;
+    const onChainPlayerId = `88${Math.floor(Math.random() * 1_000_000)}`;
+    await insertOrUpdatePlayer({ player_id: apiPlayerId, wallet: WALLET });
+
+    expect(
+      (await getPlayersMissingOnChainId('', 100)).some((row) => row.player_id === apiPlayerId),
+    ).toBe(true);
+    await setPlayerOnChainId(apiPlayerId, onChainPlayerId);
+
+    expect((await getPlayerById(apiPlayerId))?.on_chain_player_id).toBe(onChainPlayerId);
+    expect((await getPlayerByOnChainId(onChainPlayerId))?.player_id).toBe(apiPlayerId);
+  });
+
   it('queryPlayers returns players matching region filter', async () => {
     const id2 = 'test-player-db2-' + Math.random().toString(36).slice(2);
     await insertOrUpdatePlayer({ player_id: id2, wallet: WALLET, position: 'goalkeeper', region: 'EU' });
@@ -99,83 +211,116 @@ describe('player table helpers', () => {
 describe('idempotent re-indexing', () => {
   const TX_HASH = 'tx-reindex-test-' + Math.random().toString(36).slice(2);
 
-  it('INSERT OR IGNORE deduplicates events with the same (tx_hash, event_index)', () => {
-    const db = getDb();
-    const insert = db.prepare(
-      `INSERT OR IGNORE INTO events
-        (type, ledger, ledger_hash, tx_hash, payload, created_at, tx_application_order, event_index, contract_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    );
+  it('INSERT OR IGNORE deduplicates events with the same (tx_hash, event_index)', async () => {
+    await insertEvent({
+      type: 'player_registered',
+      ledger: 100,
+      ledger_hash: 'hash',
+      tx_hash: TX_HASH,
+      payload: '{}',
+      tx_application_order: 0,
+      event_index: 0,
+      contract_id: 'C',
+    });
+    const countAfterFirst = await countEvents('player_registered');
 
-    insert.run('player_registered', 100, 'hash', TX_HASH, '{}', Date.now(), 0, 0, 'C');
-    const countAfterFirst = queryEvents('player_registered').length;
-
-    insert.run('player_registered', 100, 'hash', TX_HASH, '{}', Date.now(), 0, 0, 'C');
-    const countAfterReplay = queryEvents('player_registered').length;
+    await insertEvent({
+      type: 'player_registered',
+      ledger: 100,
+      ledger_hash: 'hash',
+      tx_hash: TX_HASH,
+      payload: '{}',
+      tx_application_order: 0,
+      event_index: 0,
+      contract_id: 'C',
+    });
+    const countAfterReplay = await countEvents('player_registered');
 
     expect(countAfterReplay).toBe(countAfterFirst);
   });
 
-  it('retains co-transaction events that share a tx_hash but differ in event_index', () => {
-    const db = getDb();
+  it('retains co-transaction events that share a tx_hash but differ in event_index', async () => {
     const tx = 'tx-co-' + Math.random().toString(36).slice(2);
-    const insert = db.prepare(
-      `INSERT OR IGNORE INTO events
-        (type, ledger, ledger_hash, tx_hash, payload, created_at, tx_application_order, event_index, contract_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    await insertEvent({
+      type: 'player_registered',
+      ledger: 50,
+      ledger_hash: 'h',
+      tx_hash: tx,
+      payload: '{"player_id":"p1"}',
+      tx_application_order: 0,
+      event_index: 0,
+      contract_id: 'register',
+    });
+    await insertEvent({
+      type: 'milestone_submitted',
+      ledger: 50,
+      ledger_hash: 'h',
+      tx_hash: tx,
+      payload: '{"player_id":"p1"}',
+      tx_application_order: 0,
+      event_index: 1,
+      contract_id: 'progress',
+    });
+    const rows = await dbAll<{ type: string; event_index: number }>(
+      'SELECT type, event_index FROM events WHERE tx_hash = ? ORDER BY event_index ASC',
+      [tx],
     );
-    insert.run('player_registered', 50, 'h', tx, '{"player_id":"p1"}', Date.now(), 0, 0, 'register');
-    insert.run('milestone_submitted', 50, 'h', tx, '{"player_id":"p1"}', Date.now(), 0, 1, 'progress');
-    const rows = db
-      .prepare(
-        'SELECT type, event_index FROM events WHERE tx_hash = ? ORDER BY event_index ASC',
-      )
-      .all(tx) as Array<{ type: string; event_index: number }>;
     expect(rows).toEqual([
       { type: 'player_registered', event_index: 0 },
       { type: 'milestone_submitted', event_index: 1 },
     ]);
   });
 
-  it('persistLastIndexedLedger / fetchLastIndexedLedger round-trips correctly', () => {
-    persistLastIndexedLedger(5_000_000);
-    expect(fetchLastIndexedLedger()).toBe(5_000_000);
+  it('persistLastIndexedLedger / fetchLastIndexedLedger round-trips correctly', async () => {
+    await persistLastIndexedLedgerTest(5_000_000);
+    expect(await fetchLastIndexedLedgerTest()).toBe(5_000_000);
 
-    // Simulating a backfill reset
-    persistLastIndexedLedger(4_999_000);
-    expect(fetchLastIndexedLedger()).toBe(4_999_000);
+    await persistLastIndexedLedgerTest(4_999_000);
+    expect(await fetchLastIndexedLedgerTest()).toBe(4_999_000);
   });
 
-  it('replaying different tx_hashes at the same ledger inserts both', () => {
+  it('replaying different tx_hashes at the same ledger inserts both', async () => {
     const hash1 = 'tx-dedup-a-' + Math.random().toString(36).slice(2);
     const hash2 = 'tx-dedup-b-' + Math.random().toString(36).slice(2);
-    const db = getDb();
-    const insert = db.prepare(
-      'INSERT OR IGNORE INTO events (type, ledger, tx_hash, payload) VALUES (?, ?, ?, ?)'
-    );
 
-    const before = queryEvents().length;
-    insert.run('scout_subscribed', 200, hash1, '{}');
-    insert.run('scout_subscribed', 200, hash2, '{}');
-    const after = queryEvents().length;
+    const before = await countEvents();
+    await insertEvent({ type: 'scout_subscribed', ledger: 200, tx_hash: hash1, payload: '{}' });
+    await insertEvent({ type: 'scout_subscribed', ledger: 200, tx_hash: hash2, payload: '{}' });
+    const after = await countEvents();
 
     expect(after).toBe(before + 2);
   });
 });
 
 describe('rollbackEventsFromLedger', () => {
-  it('deletes events from the specified ledger forwards', () => {
-    const db = getDb();
-    const insert = db.prepare(
-      'INSERT OR IGNORE INTO events (type, ledger, ledger_hash, tx_hash, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+  it('deletes events from the specified ledger forwards', async () => {
+    await insertEvent({
+      type: 'type_A',
+      ledger: 300,
+      ledger_hash: 'h300',
+      tx_hash: 'tx-300',
+      payload: '{}',
+    });
+    await insertEvent({
+      type: 'type_A',
+      ledger: 301,
+      ledger_hash: 'h301',
+      tx_hash: 'tx-301',
+      payload: '{}',
+    });
+    await insertEvent({
+      type: 'type_A',
+      ledger: 302,
+      ledger_hash: 'h302',
+      tx_hash: 'tx-302',
+      payload: '{}',
+    });
+
+    await dbRun('DELETE FROM events WHERE ledger >= ?', [301]);
+
+    const remaining = await dbAll<{ ledger: number }>(
+      'SELECT ledger FROM events WHERE ledger >= 300 ORDER BY ledger ASC',
     );
-    insert.run('type_A', 300, 'h300', 'tx-300', '{}', Date.now());
-    insert.run('type_A', 301, 'h301', 'tx-301', '{}', Date.now());
-    insert.run('type_A', 302, 'h302', 'tx-302', '{}', Date.now());
-
-    rollbackEventsFromLedger(301);
-
-    const remaining = db.prepare('SELECT ledger FROM events WHERE ledger >= 300').all() as {ledger: number}[];
-    expect(remaining.map(r => r.ledger)).toEqual([300]);
+    expect(remaining.map((r) => r.ledger)).toEqual([300]);
   });
 });

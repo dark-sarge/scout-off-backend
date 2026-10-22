@@ -45,6 +45,7 @@ import { isValidIpfsOrHttpsUri } from '../utils/uriValidator';
  * | EXPIRED_TRUSTLINE   | 402  | Payment-token trustline missing/expired  |
  * | CONTRACT_PAUSED     | 503  | Contract error #10 — platform paused     |
  * | MISSING_PLAYER      | 404  | Contract error #3 — player not on-chain  |
+ * | PENDING_REGISTRATION| 409  | Wallet registration is not confirmed    |
  * | INVALID_ACCOUNT     | 400  | Missing/malformed wallet or playerId     |
  * | CONTRACT_ERROR      | 502  | Contract rejected the transaction        |
  * | NETWORK_ERROR       | 502  | RPC failure / confirmation timeout       |
@@ -59,6 +60,8 @@ export function paymentErrorStatus(code: PaymentError['code']): number {
       return 503;
     case 'MISSING_PLAYER':
       return 404;
+    case 'PENDING_REGISTRATION':
+      return 409;
     case 'INVALID_ACCOUNT':
       return 400;
     case 'CONTRACT_ERROR':
@@ -137,7 +140,7 @@ async function scoutHasPlayerAccess(scoutWallet: string, playerId: string): Prom
   if (localSub && localSub.expires_at > graceThreshold) return true;
 
   // 3. Indexed scout_subscribed events (fallback for pre-table records)
-  const subs = queryEvents('scout_subscribed').filter((e) => e.payload.scout === scoutWallet);
+  const subs = queryEvents('scout_subscribed', { payloadFilter: { scout: scoutWallet } });
   const latestSub = subs.at(-1);
   if (latestSub) {
     const expiresAt = latestSub.payload.subscription_expiry as number;
@@ -193,7 +196,7 @@ export async function getSubscription(req: Request, res: Response, next: NextFun
   }
 
   // Fall back to indexed events
-  const subs = queryEvents('scout_subscribed').filter((e) => e.payload.scout === wallet);
+  const subs = queryEvents('scout_subscribed', { payloadFilter: { scout: wallet } });
   const latest = subs.at(-1);
   if (!latest) {
     res.json({
@@ -330,7 +333,7 @@ try {
     }
   } catch (err) {
     if (err instanceof PaymentError) {
-      res.status(402).json({ success: false, error: err.message, code: err.code });
+      res.status(paymentErrorStatus(err.code)).json({ success: false, error: err.message, code: err.code });
       return;
     }
     next(err);
@@ -537,7 +540,11 @@ try {
     const { playerId, detailsUri } = parsed.data;
 
     // Verify player exists
-    const playerExists = queryEvents('player_registered').some((e) => e.payload.player_id === playerId);
+    const playerExists = queryEvents('player_registered', {
+      payloadFilter: { player_id: playerId },
+      limit: 1,
+      offset: 0,
+    }).length > 0;
     if (!playerExists) {
       res.status(404).json({ success: false, error: 'Player not found', code: ErrorCode.PLAYER_NOT_FOUND });
       return;
@@ -615,7 +622,7 @@ try {
     });
   } catch (err) {
     if (err instanceof PaymentError) {
-      res.status(402).json({ success: false, error: err.message, code: err.code });
+      res.status(paymentErrorStatus(err.code)).json({ success: false, error: err.message, code: err.code });
       return;
     }
     next(err);
@@ -703,9 +710,9 @@ export async function getPaymentHistory(req: Request, res: Response, next: NextF
 
     // Also pull from contact_unlocked contract events for tx_hash + fee info
     // (these may contain fee amounts that the DB row doesn't store)
-    const contactEvents = queryEvents('contact_unlocked').filter(
-      (e) => e.payload.scout === wallet,
-    );
+    const contactEvents = queryEvents('contact_unlocked', {
+      payloadFilter: { scout: wallet },
+    });
     for (const e of contactEvents) {
       const ts = (e.payload.timestamp as string | undefined) ?? new Date(0).toISOString();
       if (fromDate && new Date(ts) < fromDate) continue;
@@ -898,7 +905,7 @@ export async function getScoutDashboard(
         };
       } else {
         // Fall back to indexed events
-        const subs = queryEvents('scout_subscribed').filter((e) => e.payload.scout === wallet);
+        const subs = queryEvents('scout_subscribed', { payloadFilter: { scout: wallet } });
         const latest = subs.at(-1);
         if (latest) {
           const expiresAt = latest.payload.subscription_expiry as number;

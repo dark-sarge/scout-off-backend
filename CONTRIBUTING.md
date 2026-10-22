@@ -24,6 +24,10 @@ Welcome! This guide covers contribution workflows, code standards, and critical 
   - If you use **asdf**: `asdf install nodejs` (reads `.nvmrc` via the Node.js plugin)
 - npm ≥ 10
 - Git
+- **Rust (for contracts contributors)**: Pinned to `1.81.0` via [`contracts/rust-toolchain.toml`](contracts/rust-toolchain.toml).
+  - Target: `wasm32-unknown-unknown`
+  - Components: `rustfmt`, `clippy`
+  - When working inside `contracts/`, `rustup` automatically activates the pinned toolchain, ensuring deterministic WASM bytecode and matching contract hashes. See [contracts/README.md](contracts/README.md) for build, test, and upgrade instructions.
 
 > CI's `lint` and `test` jobs run across a matrix of Node 22 and 24 (`.github/workflows/ci.yml`) so a regression that only manifests on one supported version is caught before merge. `.nvmrc` remains the default for local dev; bump `engines.node` in `package.json` alongside the CI matrix if the supported range changes.
 
@@ -483,7 +487,7 @@ Dependabot is configured in `.github/dependabot.yml` to open pull requests for o
 
 When Dependabot opens a Cargo PR, verify:
 1. Review the Cargo.lock diff and the crate's CHANGELOG for breaking changes.
-2. Run `cd contracts && cargo test --target x86_64-unknown-linux-gnu` locally to confirm the contracts still build and pass tests.
+2. Run `npm run test:contracts` locally to run the workspace unit tests and CI-sized invariant tests.
 3. Merge or close the PR — do **not** leave stale Dependabot PRs open longer than one sprint.
 
 ### Supply Chain Security

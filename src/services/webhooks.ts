@@ -6,6 +6,7 @@ import { recordWebhookDelivery, incrementWebhookDeadLettersTotal } from '../midd
 import { trace, SpanStatusCode } from '@opentelemetry/api';
 import config from '../config';
 import { getCorrelationId } from '../utils/requestContext';
+import { getVersionInfo } from '../version';
 
 /**
  * Generate a unique, stable delivery identifier for a webhook event.
@@ -34,35 +35,55 @@ type WebhookRetryOptions = {
    * config.webhook.timeoutMs.
    */
   timeoutMs?: number;
+  /** Event type sent as the `X-Webhook-Event` header. */
+  eventType?: string;
+  /** Stable delivery id sent as the `X-Webhook-Delivery` header. */
+  deliveryId?: string;
 };
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Generate a simple unique delivery ID (timestamp + random hex). */
-function newDeliveryId(): string {
-  return `wh_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
-}
-
 /**
  * Computes the `X-Webhook-Signature` header value for a raw request body.
  *
- * Format: `sha256=<hex-encoded HMAC-SHA256 digest>`, computed over the exact
- * raw bytes sent on the wire (not a re-serialized object) using the
- * subscriber's secret as the HMAC key. See docs/webhooks.md for the
- * receiver-side verification procedure.
+ * Format: `sha256=<hex-encoded HMAC-SHA256 digest>`, computed over
+ * `<timestamp>.<raw body>` using the subscriber's secret as the HMAC key.
+ * The timestamp is Unix time in seconds and is sent separately in the
+ * `X-Webhook-Timestamp` header.
  */
-export function signWebhookPayload(rawBody: string, secret: string): string {
-  const digest = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+export function signWebhookPayload(rawBody: string, secret: string, timestamp: string): string {
+  const digest = crypto
+    .createHmac('sha256', secret)
+    .update(`${timestamp}.${rawBody}`)
+    .digest('hex');
   return `sha256=${digest}`;
+}
+
+function parseRetryAfter(response: Awaited<ReturnType<typeof fetch>>): number | null {
+  const retryAfter = response.headers.get('retry-after');
+  if (retryAfter === null) return null;
+
+  const value = retryAfter.trim();
+  if (/^\d+$/.test(value)) {
+    return Math.min(Number(value) * 1000, 2_147_483_647);
+  }
+
+  const retryAt = Date.parse(value);
+  return Number.isNaN(retryAt)
+    ? null
+    : Math.min(Math.max(0, retryAt - Date.now()), 2_147_483_647);
 }
 
 /**
  * Executes a webhook POST with retry logic.
- * Uses exponential backoff between attempts to reduce pressure on transient failures.
+ * Uses full-jitter exponential backoff between attempts to avoid synchronized retries.
  * When `options.secret` is provided, signs the raw request body and attaches it as
- * the `X-Webhook-Signature` header.
+ * the `X-Webhook-Signature` header. Always attaches a descriptive `User-Agent`
+ * plus `X-Webhook-Event`/`X-Webhook-Delivery` headers when the corresponding
+ * options are provided, so receivers can route and deduplicate without parsing
+ * the body.
  */
 export async function postWebhookWithRetry(
   url: string,
@@ -79,28 +100,50 @@ export async function postWebhookWithRetry(
 
     // Serialize once so the signature is computed over the exact bytes sent.
     const rawBody = JSON.stringify(payload);
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (options.secret) {
-      headers['X-Webhook-Signature'] = signWebhookPayload(rawBody, options.secret);
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'User-Agent': `ScoutOff-Webhooks/${getVersionInfo().version}`,
+    };
+    if (options.eventType) {
+      headers['X-Webhook-Event'] = options.eventType;
+    }
+    if (options.deliveryId) {
+      headers['X-Webhook-Delivery'] = options.deliveryId;
     }
 
     for (let attempt = 1; attempt <= retries; attempt += 1) {
       span.setAttribute('webhook.attempt', attempt);
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
+      let retryAfterMs: number | null = null;
       try {
+        const requestHeaders = { ...headers };
+        if (options.secret) {
+          const timestamp = String(Math.floor(Date.now() / 1000));
+          requestHeaders['X-Webhook-Timestamp'] = timestamp;
+          requestHeaders['X-Webhook-Signature'] = signWebhookPayload(
+            rawBody,
+            options.secret,
+            timestamp,
+          );
+        }
         const response = await fetch(url, {
           method: 'POST',
           body: rawBody,
-          headers,
+          headers: requestHeaders,
           signal: controller.signal,
         });
 
         if (!response.ok) {
           span.setAttribute('webhook.status', response.status);
+          if (response.status === 429 || response.status === 503) {
+            retryAfterMs = parseRetryAfter(response);
+          }
+          response.body?.resume();
           throw new Error(`Webhook dispatch failed with status ${response.status}`);
         }
         span.setAttribute('webhook.status', response.status);
+        response.body?.resume();
         return;
       } catch (err) {
         lastError = controller.signal.aborted
@@ -111,7 +154,9 @@ export async function postWebhookWithRetry(
       }
 
       if (attempt < retries) {
-        const delayMs = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
+        const backoffCapMs = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
+        const delayMs =
+          retryAfterMs ?? Math.floor(Math.random() * (backoffCapMs + 1));
         await sleep(delayMs);
       }
     }
@@ -203,6 +248,8 @@ async function deliverToSubscription(
     await postWebhookWithRetry(subscription.url, body, {
       ...RETRY_OPTIONS,
       secret: subscription.secret,
+      eventType,
+      deliveryId,
     });
     recordWebhookDelivery('success');
     recordDeliveryHistory(subscription, eventType, deliveryId, {

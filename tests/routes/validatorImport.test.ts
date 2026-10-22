@@ -27,8 +27,11 @@
 // below) that picks up the real value.
 process.env.PLATFORM_SECRET_KEY = 'SDAT3WOW2WIVH5VRHJDRKXZ7I5IAOGFK7CDPT4GKJKW2LDQ3YMJ56QJQ';
 jest.resetModules();
+// initDb() is async under DB_DRIVER=postgres, so keep its promise and await it
+// in beforeAll below; otherwise early tests can race the connection setup.
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-require('../../src/db').initDb();
+const dbReady: Promise<void> = Promise.resolve(require('../../src/db').initDb());
+beforeAll(() => dbReady);
 
 import request from 'supertest';
 import { Keypair, Transaction, Networks } from '@stellar/stellar-sdk';

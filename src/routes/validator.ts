@@ -78,10 +78,16 @@ router.route('/milestones/pending')
  *
  * @param wallet {string} - Validator's Stellar public key
  * @response 200 { success: true, data: PendingMilestone[], total, page, pageSize }
- * @auth Bearer (validator role required)
+ * @response 403 { success: false, error: string } - Wallet mismatch (non-admin/non-owner)
+ * @auth Bearer (validator role required; wallet must match authenticated account)
  */
 router.route('/:wallet/milestones/pending')
-  .get(requireRole('validator'), validateQuery(pendingQuerySchema), getPendingMilestones)
+  .get(
+    requireRole('validator', 'admin'),
+    requireWalletOwner({ mismatchStatus: 401 }),
+    validateQuery(pendingQuerySchema),
+    getPendingMilestones,
+  )
   .all(methodNotAllowed(['GET', 'HEAD']));
 
 /**

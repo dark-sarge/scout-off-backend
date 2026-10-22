@@ -12,6 +12,7 @@ import request from 'supertest';
 import jwt from 'jsonwebtoken';
 import app from '../../src/app';
 import { generateApiKey, verifyApiKey, resolveApiKey } from '../../src/controllers/apiKeyController';
+import { ApiKeyLimitError } from '../../src/utils/scoutResourceLimits';
 
 const SECRET = process.env.JWT_SECRET ?? 'test-secret';
 
@@ -152,6 +153,25 @@ describe('generateApiKey / verifyApiKey (unit)', () => {
   it('never stores plaintext — keyHash does not contain the raw key', () => {
     const { key, keyHash } = generateApiKey();
     expect(keyHash).not.toContain(key);
+  });
+});
+
+describe('POST /api/scouts/:wallet/api-keys quota', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('returns 409 when the scout has reached the API key limit', async () => {
+    mockInsertApiKey.mockRejectedValueOnce(new ApiKeyLimitError());
+
+    const res = await request(app)
+      .post(`/api/scouts/${SCOUT_A}/api-keys`)
+      .set('Authorization', `Bearer ${scoutAToken}`)
+      .send({});
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({
+      success: false,
+      error: 'API key limit reached (10 per scout)',
+    });
   });
 });
 

@@ -43,6 +43,13 @@ jest.mock('../../src/services/audit', () => ({
 jest.mock('../../src/services/indexer', () => ({
   normalizePayload: jest.fn((p: Record<string, unknown>) => p),
   normalizeEventId: jest.fn((_contractId: string, ledger: number, txHash: string) => `${ledger}:${txHash}`),
+  normalizeSorobanEvent: jest.fn((raw: { topic: unknown[]; value: unknown }) => {
+    const { scValToNative } = require('@stellar/stellar-sdk');
+    return {
+      type: scValToNative(raw.topic[0]),
+      payload: scValToNative(raw.value),
+    };
+  }),
 }));
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -76,6 +83,14 @@ function makeEvent(
 
 beforeEach(() => {
   jest.clearAllMocks();
+  const indexerModule = require('../../src/services/indexer');
+  indexerModule.normalizeSorobanEvent.mockImplementation((raw: { topic: unknown[]; value: unknown }) => {
+    const { scValToNative } = require('@stellar/stellar-sdk');
+    return {
+      type: scValToNative(raw.topic[0]),
+      payload: scValToNative(raw.value),
+    };
+  });
   _resetReplayState();
 });
 
@@ -373,12 +388,12 @@ describe('error handling', () => {
   });
 
   it('transitions to error status when a fatal error occurs inside the batch transaction', async () => {
-    // Mock normalizePayload (called inside the db.transaction callback) to
+    // Mock normalizeSorobanEvent (called inside the db.transaction callback) to
     // throw a fatal error after the events are fetched — this escapes the
     // inner per-batch RPC catch and hits the outer try/catch, setting
     // status: 'error'.
     const indexerModule = require('../../src/services/indexer');
-    const normalizeSpy = jest.spyOn(indexerModule, 'normalizePayload')
+    const normalizeSpy = jest.spyOn(indexerModule, 'normalizeSorobanEvent')
       .mockImplementation(() => { throw new Error('database is locked'); });
 
     mockGetEvents.mockResolvedValue({
@@ -401,7 +416,7 @@ describe('error handling', () => {
   it('fires a replay_error audit event when the job fails', async () => {
     const { logAuditEvent } = require('../../src/services/audit');
     const indexerModule = require('../../src/services/indexer');
-    const normalizeSpy = jest.spyOn(indexerModule, 'normalizePayload')
+    const normalizeSpy = jest.spyOn(indexerModule, 'normalizeSorobanEvent')
       .mockImplementation(() => { throw new Error('fatal db error'); });
 
     mockGetEvents.mockResolvedValue({
@@ -423,7 +438,7 @@ describe('error handling', () => {
 
   it('allows a new job to start after an errored job is reset', async () => {
     const indexerModule = require('../../src/services/indexer');
-    const normalizeSpy = jest.spyOn(indexerModule, 'normalizePayload')
+    const normalizeSpy = jest.spyOn(indexerModule, 'normalizeSorobanEvent')
       .mockImplementation(() => { throw new Error('disk full'); });
 
     mockGetEvents.mockResolvedValue({
@@ -444,7 +459,7 @@ describe('error handling', () => {
 
   it('returns error information when the job fails', async () => {
     const indexerModule = require('../../src/services/indexer');
-    const normalizeSpy = jest.spyOn(indexerModule, 'normalizePayload')
+    const normalizeSpy = jest.spyOn(indexerModule, 'normalizeSorobanEvent')
       .mockImplementation(() => { throw new Error('crash'); });
 
     mockGetEvents.mockResolvedValue({
@@ -482,7 +497,7 @@ describe('event deduplication', () => {
 
     // eventsInserted should be 0 (duplicate, not a new row)
     expect(result.eventsInserted).toBe(0);
-    expect(getReplayStatus().status).toBe('complete');
+    expect(getReplayStatus()).toMatchObject({ status: 'complete', errorMessage: null });
   });
 });
 

@@ -8,9 +8,14 @@ updates:
     target-branch: main
     open-pull-requests-limit: 5
     labels:
-      - dependencies
       - infrastructure
-      - javascript
+    groups:
+      npm-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
 
   - package-ecosystem: cargo
     directory: /contracts
@@ -20,9 +25,25 @@ updates:
     target-branch: main
     open-pull-requests-limit: 5
     labels:
-      - infra
-      - easy
+      - infrastructure
     groups:
       soroban-deps:
         patterns:
           - "soroban-*"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    target-branch: main
+    open-pull-requests-limit: 5
+    labels:
+      - infrastructure
+    groups:
+      github-actions-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch

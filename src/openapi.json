@@ -93,6 +93,13 @@
       }
     },
     "schemas": {
+      "ErrorCode": {
+        "type": "string",
+        "description": "Machine-readable error code returned in API responses.",
+        "enum": [
+          "REQUEST_TIMEOUT"
+        ]
+      },
       "SuccessEnvelope": {
         "type": "object",
         "required": [
@@ -136,7 +143,20 @@
         ],
         "properties": {
           "player_id": {
-            "type": "string"
+            "type": "string",
+            "description": "API player identifier (cuid2)"
+          },
+          "on_chain_player_id": {
+            "type": "string",
+            "nullable": true,
+            "description": "Sequential u64 ID assigned by the register contract; null while registration is pending"
+          },
+          "registration_status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "registered"
+            ]
           },
           "wallet": {
             "type": "string"
@@ -2419,6 +2439,38 @@
         "security": []
       }
     },
+    "/docs/swagger-ui-bundle.js": {
+      "get": {
+        "tags": [
+          "docs"
+        ],
+        "summary": "Serves the Swagger UI JavaScript bundle from swagger-ui-dist for the /ui page.",
+        "operationId": "getDocsSwagger-ui-bundle.js",
+        "description": "Serves the Swagger UI JavaScript bundle from swagger-ui-dist for the /ui page.",
+        "responses": {
+          "200": {
+            "description": "Swagger UI JavaScript bundle (text/javascript)"
+          }
+        },
+        "security": []
+      }
+    },
+    "/docs/swagger-ui.css": {
+      "get": {
+        "tags": [
+          "docs"
+        ],
+        "summary": "Serves the Swagger UI stylesheet from swagger-ui-dist for the /ui page.",
+        "operationId": "getDocsSwagger-ui.css",
+        "description": "Serves the Swagger UI stylesheet from swagger-ui-dist for the /ui page.",
+        "responses": {
+          "200": {
+            "description": "Swagger UI stylesheet (text/css)"
+          }
+        },
+        "security": []
+      }
+    },
     "/docs/ui": {
       "get": {
         "tags": [
@@ -2464,19 +2516,25 @@
         ],
         "summary": "Server-Sent Events endpoint.",
         "operationId": "getEventsStream",
-        "description": "Server-Sent Events endpoint. Opens a long-lived HTTP connection and pushes\nrelevant contract events to the authenticated client as they are indexed.\n\nAuthentication: Bearer JWT (same as all other protected routes).\n\nQuery parameters (all optional, combinable):\n  - eventType  One event type name to subscribe to (e.g. \"milestone_approved\").\n               When omitted the client receives all event types that pass the\n               wallet-relevance filter.  Unknown values are ignored.\n  - playerId   Only deliver events whose payload contains this player identifier.\n               When omitted no additional player-level filtering is applied.\n\nFiltering: only events relevant to the authenticated wallet are sent (wallet\nisolation is always enforced regardless of query params).  The optional\nquery params add further narrowing on top.\n\nSSE event types sent:\n  - milestone_approved  (player: their own milestone approvals)\n  - scout_subscribed    (scout: their own subscription changes)\n  - contact_unlocked    (scout: their own contact unlocks)\n  - trial_offer_logged  (scout/player: trial offers involving them)\n  - player_registered   (player: their own registration)\n  - milestone_submitted (player/validator)\n  - fees_withdrawn      (admin)\n\nLive authorization enforcement (#1019):\n  - If the authenticated JWT is revoked (via POST /auth/logout or admin\n    token revocation) while the stream is open, the connection emits a\n    terminal `session_ended` event (reason \"token_revoked\") and closes;\n    no further protected events are delivered.\n  - If the wallet is blocklisted while the stream is open, the same\n    termination happens with reason \"wallet_blocklisted\".\n  - Detection bound: immediate for revocations/blocklists processed in\n    this process; ≤ SSE_AUTH_SWEEP_INTERVAL_MS (default 30 s) for changes\n    persisted by another instance (one sweep query per process, never a\n    DB query per keep-alive tick).\n  - Blocklisted wallets cannot open a new connection (403).\n\nKeep-alive: a `: ping` comment is sent every SSE_KEEPALIVE_INTERVAL_MS ms\n(default 15 s) to prevent idle-connection timeouts.",
+        "description": "Server-Sent Events endpoint. Opens a long-lived HTTP connection and pushes\nrelevant contract events to the authenticated client as they are indexed.\n\nAuthentication: Bearer JWT (same as all other protected routes).\n\nQuery parameters (all optional, combinable):\n  - eventType  One or more event type names to subscribe to, comma-separated\n               (e.g. \"milestone_approved\" or\n               \"milestone_approved,scout_subscribed\"). When omitted the\n               client receives all event types that pass the\n               wallet-relevance filter. Unknown values are rejected with 400.\n  - playerId   Only deliver events whose payload contains this player identifier.\n               When omitted no additional player-level filtering is applied.\n\nFiltering: only events relevant to the authenticated wallet are sent (wallet\nisolation is always enforced regardless of query params). Player events are\nmatched through the authenticated wallet's player record, since their payload\ncarries a player ID rather than a wallet address. Optional query params add\nfurther narrowing on top.\n\nSSE event types sent:\n  - milestone_approved  (player: their own milestone approvals)\n  - scout_subscribed    (scout: their own subscription changes)\n  - contact_unlocked    (scout: their own contact unlocks)\n  - trial_offer_logged  (scout/player: trial offers involving them)\n  - player_registered   (player: their own registration)\n  - milestone_submitted (player/validator)\n  - fees_withdrawn      (admin)\n\nLive authorization enforcement (#1019):\n  - If the authenticated JWT is revoked (via POST /auth/logout or admin\n    token revocation) while the stream is open, the connection emits a\n    terminal `session_ended` event (reason \"token_revoked\") and closes;\n    no further protected events are delivered.\n  - If the wallet is blocklisted while the stream is open, the same\n    termination happens with reason \"wallet_blocklisted\".\n  - When the access JWT expires, the stream closes with reason \"token_expired\".\n  - Detection bound: immediate for revocations/blocklists processed in\n    this process; ≤ SSE_AUTH_SWEEP_INTERVAL_MS (default 30 s) for changes\n    persisted by another instance (one sweep query per process, never a\n    DB query per keep-alive tick).\n  - Blocklisted wallets cannot open a new connection (403).\n  - Concurrent streams are limited per wallet by\n    SSE_MAX_CONNECTIONS_PER_WALLET (default 5; 0 = unlimited).\n\nReconnection: initial `retry:` hint is sent on connect (configured via\nSSE_RETRY_MS, default 5000 ms + up to 20% random jitter) to prevent reconnect storms.\n\nKeep-alive: a `: ping` comment is sent every SSE_KEEPALIVE_INTERVAL_MS ms\n(default 15 s) to prevent idle-connection timeouts.",
         "responses": {
           "200": {
             "description": "text/event-stream — long-lived SSE connection"
+          },
+          "400": {
+            "description": "{ success: false, error: string, code: string, validEventTypes: string[] } — unknown eventType"
           },
           "401": {
             "description": "{ success: false, error: string } — missing or invalid token"
           },
           "403": {
-            "description": "{ success: false, error: string } — wallet is blocklisted"
+            "description": "{ success: false, error: string, code: 'WALLET_BLOCKLISTED' } — wallet is blocklisted"
+          },
+          "429": {
+            "description": "{ success: false, error: string } — per-wallet connection limit reached"
           },
           "503": {
-            "description": "{ success: false, error: string } — connection limit reached"
+            "description": "{ success: false, error: string, code: 'SSE_CAPACITY' } — global connection limit reached (sets Retry-After)"
           }
         },
         "security": [
@@ -2687,7 +2745,7 @@
         },
         "responses": {
           "201": {
-            "description": "{ success: true, data: { playerId, metadataUri, gatewayUrl } }"
+            "description": "{ success: true, data: { playerId, onChainPlayerId, registrationStatus, onChainRegistration, metadataUri, gatewayUrl } }"
           },
           "400": {
             "description": "{ success: false, error: string } - Invalid body"
@@ -3267,7 +3325,7 @@
         ],
         "summary": "Purchase Player Tokens for the given player (stub — no real XLM transfer).",
         "operationId": "buyPlayerToken",
-        "description": "Purchase Player Tokens for the given player (stub — no real XLM transfer).\nGated by the `player_tokens` feature flag — returns 404 when disabled.",
+        "description": "Purchase Player Tokens for the given player (stub — no real XLM transfer).\nGated by the `player_tokens` feature flag — returns 404 when disabled.\nThe authenticated account is the buyer; the optional buyerWallet field is\naccepted for compatibility only when it matches that account.",
         "parameters": [
           {
             "name": "playerId",
@@ -3281,7 +3339,7 @@
         ],
         "requestBody": {
           "required": true,
-          "description": "{ amount: number, buyerWallet: string }",
+          "description": "{ amount: number, buyerWallet?: string }",
           "content": {
             "application/json": {
               "schema": {
@@ -3297,8 +3355,7 @@
                   }
                 },
                 "required": [
-                  "amount",
-                  "buyerWallet"
+                  "amount"
                 ],
                 "additionalProperties": false
               }
@@ -3311,6 +3368,12 @@
           },
           "400": {
             "description": "{ success: false, error: string } - Invalid amount"
+          },
+          "401": {
+            "description": "{ success: false, error: string } - Authentication required"
+          },
+          "403": {
+            "description": "{ success: false, error: string } - buyerWallet does not match authenticated account"
           },
           "404": {
             "description": "{ success: false, error: string } - Feature flag disabled or player not found"
@@ -3493,11 +3556,17 @@
         "security": [
           {
             "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": [
+              "read:api_keys"
+            ]
           }
         ],
         "x-required-role": [
           "scout"
         ],
+        "x-api-key-scope": "read:api_keys",
         "x-owner-only": true
       },
       "post": {
@@ -3729,11 +3798,17 @@
         "security": [
           {
             "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": [
+              "read:bookmarks"
+            ]
           }
         ],
         "x-required-role": [
           "scout"
         ],
+        "x-api-key-scope": "read:bookmarks",
         "x-owner-only": true
       },
       "post": {
@@ -3893,11 +3968,17 @@
         "security": [
           {
             "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": [
+              "read:bookmarks"
+            ]
           }
         ],
         "x-required-role": [
           "scout"
         ],
+        "x-api-key-scope": "read:bookmarks",
         "x-owner-only": true
       },
       "post": {
@@ -4068,11 +4149,17 @@
         "security": [
           {
             "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": [
+              "read:contacts"
+            ]
           }
         ],
         "x-required-role": [
           "scout"
         ],
+        "x-api-key-scope": "read:contacts",
         "x-owner-only": true
       }
     },
@@ -4121,11 +4208,17 @@
         "security": [
           {
             "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": [
+              "read:contacts"
+            ]
           }
         ],
         "x-required-role": [
           "scout"
         ],
+        "x-api-key-scope": "read:contacts",
         "x-owner-only": true
       }
     },
@@ -4239,11 +4332,17 @@
         "security": [
           {
             "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": [
+              "read:dashboard"
+            ]
           }
         ],
         "x-required-role": [
           "scout"
         ],
+        "x-api-key-scope": "read:dashboard",
         "x-owner-only": true
       }
     },
@@ -4274,11 +4373,17 @@
         "security": [
           {
             "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": [
+              "read:notes"
+            ]
           }
         ],
         "x-required-role": [
           "scout"
         ],
+        "x-api-key-scope": "read:notes",
         "x-owner-only": true
       }
     },
@@ -4321,11 +4426,17 @@
         "security": [
           {
             "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": [
+              "read:notes"
+            ]
           }
         ],
         "x-required-role": [
           "scout"
         ],
+        "x-api-key-scope": "read:notes",
         "x-owner-only": true
       },
       "put": {
@@ -4486,11 +4597,17 @@
         "security": [
           {
             "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": [
+              "read:payments"
+            ]
           }
         ],
         "x-required-role": [
           "scout"
         ],
+        "x-api-key-scope": "read:payments",
         "x-owner-only": true
       }
     },
@@ -4533,11 +4650,17 @@
         "security": [
           {
             "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": [
+              "read:notes"
+            ]
           }
         ],
         "x-required-role": [
           "scout"
         ],
+        "x-api-key-scope": "read:notes",
         "x-owner-only": true
       },
       "post": {
@@ -4819,11 +4942,17 @@
         "security": [
           {
             "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": [
+              "read:recommendations"
+            ]
           }
         ],
         "x-required-role": [
           "scout"
         ],
+        "x-api-key-scope": "read:recommendations",
         "x-owner-only": true
       }
     },
@@ -4860,14 +4989,14 @@
           },
           {
             "apiKeyAuth": [
-              "write:saved_searches"
+              "read:saved_searches"
             ]
           }
         ],
         "x-required-role": [
           "scout"
         ],
-        "x-api-key-scope": "write:saved_searches",
+        "x-api-key-scope": "read:saved_searches",
         "x-owner-only": true
       },
       "post": {
@@ -5169,11 +5298,17 @@
         "security": [
           {
             "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": [
+              "read:saved_searches"
+            ]
           }
         ],
         "x-required-role": [
           "scout"
         ],
+        "x-api-key-scope": "read:saved_searches",
         "x-owner-only": true
       }
     },
@@ -5442,8 +5577,8 @@
           "scouts"
         ],
         "summary": "DEPRECATED alias of POST /api/scouts/:wallet/trial-offers (#1034).",
-        "operationId": "createTrialOffer",
-        "description": "DEPRECATED alias of POST /api/scouts/:wallet/trial-offers (#1034). It runs the\nsame handler, so it carries the same middleware chain — including walletRateLimit\nand idempotency, which guard the on-chain submission this route now performs.\n\nUse POST /api/scouts/:wallet/trial-offers instead.",
+        "operationId": "createTrialOfferAtScoutsByWalletTrialOfferPost",
+        "description": "DEPRECATED alias of POST /api/scouts/:wallet/trial-offers (#1034). It runs the\nsame handler, so it carries the same middleware chain — including walletRateLimit\nand idempotency, which guard the on-chain submission this route now performs.\n\nUse POST /api/scouts/:wallet/trial-offers instead.\nResponses include the RFC 9745 Deprecation header, effective 2026-08-18.",
         "deprecated": true,
         "parameters": [
           {
@@ -5542,23 +5677,33 @@
         "responses": {
           "200": {
             "description": "{ success: true, data: TrialOfferEvent[] }"
+          },
+          "403": {
+            "description": "{ success: false, error: string } - Wallet mismatch (non-admin/non-owner)"
           }
         },
         "security": [
           {
             "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": [
+              "read:trial_offers"
+            ]
           }
         ],
         "x-required-role": [
           "scout"
-        ]
+        ],
+        "x-api-key-scope": "read:trial_offers",
+        "x-owner-only": true
       },
       "post": {
         "tags": [
           "scouts"
         ],
         "summary": "Submit a trial offer on-chain and promote the player to Elite Tier.",
-        "operationId": "createTrialOffer",
+        "operationId": "createTrialOfferAtScoutsByWalletTrialOffersPost",
         "description": "Canonical trial-offer submission (#285, #770): submits the offer on-chain,\nindexes it locally by tx_hash, promotes the player's tier and broadcasts SSE.\nThe singular /trial-offer path above is a deprecated alias of this POST.\nDistinct from the accept/reject workflow in trialOfferController.",
         "parameters": [
           {
@@ -5724,11 +5869,17 @@
         "security": [
           {
             "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": [
+              "read:webhooks"
+            ]
           }
         ],
         "x-required-role": [
           "scout"
         ],
+        "x-api-key-scope": "read:webhooks",
         "x-owner-only": true
       },
       "post": {
@@ -6078,7 +6229,7 @@
           "validators"
         ],
         "summary": "List pending milestones for the authenticated validator, optionally filtered by region/position/playerId and paginated.",
-        "operationId": "getPendingMilestones",
+        "operationId": "getPendingMilestonesAtValidatorsMilestonesPendingGet",
         "description": "List pending milestones for the authenticated validator, optionally\nfiltered by region/position/playerId and paginated.",
         "parameters": [
           {
@@ -6162,7 +6313,7 @@
           "validators"
         ],
         "summary": "Same as GET /api/validators/milestones/pending, scoped explicitly to the given validator wallet rather than the caller's own token.",
-        "operationId": "getPendingMilestones",
+        "operationId": "getPendingMilestonesAtValidatorsByWalletMilestonesPendingGet",
         "description": "Same as GET /api/validators/milestones/pending, scoped explicitly to the\ngiven validator wallet rather than the caller's own token.",
         "parameters": [
           {
@@ -6237,6 +6388,9 @@
         "responses": {
           "200": {
             "description": "{ success: true, data: PendingMilestone[], total, page, pageSize }"
+          },
+          "403": {
+            "description": "{ success: false, error: string } - Wallet mismatch (non-admin/non-owner)"
           }
         },
         "security": [
@@ -6246,7 +6400,8 @@
         ],
         "x-required-role": [
           "validator"
-        ]
+        ],
+        "x-owner-only": true
       }
     },
     "/validators/{wallet}/stats": {

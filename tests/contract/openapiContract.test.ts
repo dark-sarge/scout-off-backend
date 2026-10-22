@@ -361,6 +361,8 @@ const ALLOWLIST: Record<string, string> = {
   "GET /docs": "serves the OpenAPI spec itself; validating it against itself is circular",
   "GET /docs/ui": "serves Swagger UI HTML (non-JSON)",
   "GET /docs/yaml": "serves raw YAML (non-JSON)",
+  "GET /docs/swagger-ui.css": "serves the Swagger UI stylesheet (non-JSON static asset)",
+  "GET /docs/swagger-ui-bundle.js": "serves the Swagger UI JS bundle (non-JSON static asset)",
 
   // Events — SSE is a long-lived stream, not a JSON response.
   "GET /events/stream": "SSE stream; long-lived connection, not a JSON envelope",

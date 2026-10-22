@@ -182,6 +182,43 @@ describe('queryEvents - SQL injection resistance', () => {
     });
   });
 
+  it('filters and counts payload fields in SQL before parsing event rows', () => {
+    const db = getDb();
+    const txHash = `filtered-event-${Math.random().toString(36).slice(2)}`;
+    db.prepare(
+      'INSERT INTO events (type, ledger, tx_hash, payload, created_at) VALUES (?, ?, ?, ?, ?)',
+    ).run('milestone_approved', 2, txHash, '{"player_id":"target","validator":"wallet"}', 2000);
+    db.prepare(
+      'INSERT INTO events (type, ledger, tx_hash, payload, created_at) VALUES (?, ?, ?, ?, ?)',
+    ).run('milestone_approved', 3, `${txHash}-other`, '{"player_id":"other","validator":"wallet"}', 3000);
+
+    const filtered = queryEvents('milestone_approved', {
+      payloadFilter: { player_id: 'target' },
+      createdAfter: 1500,
+    });
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].payload.player_id).toBe('target');
+    expect(
+      queryEvents('milestone_approved', {
+        payloadAnyOf: [{ player_id: 'target' }, { player_id: 'missing' }],
+        payloadIn: { validator: ['wallet'] },
+        limit: 1,
+        offset: 0,
+      }),
+    ).toHaveLength(1);
+    expect(
+      getEventsCount('milestone_approved', {
+        payloadFilter: { player_id: 'target' },
+      }),
+    ).toBe(1);
+    expect(() =>
+      queryEvents('milestone_approved', {
+        payloadFilter: { 'player_id) = 1 --': 'target' },
+      }),
+    ).toThrow('Invalid event payload field');
+    db.prepare('DELETE FROM events WHERE tx_hash IN (?, ?)').run(txHash, `${txHash}-other`);
+  });
+
   it('events table still exists after injection attempts', () => {
     expect(queryEvents()).toHaveLength(1);
   });

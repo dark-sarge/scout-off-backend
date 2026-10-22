@@ -19,6 +19,7 @@ import {
 const WALLET_A = 'GAWALLETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
 const WALLET_B = 'GAWALLETBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
 const WALLET_C = 'GAWALLETCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC';
+const PLAYER_1 = 'player-cuid-1';
 
 beforeEach(() => {
   EventBroadcaster._resetForTests();
@@ -28,17 +29,19 @@ beforeEach(() => {
 
 describe('isEventRelevantToWallet', () => {
   describe('milestone_approved', () => {
-    it('returns true when player_id matches wallet', () => {
+    it('returns true when player_id matches the wallet owner player ID', () => {
       expect(isEventRelevantToWallet(
-        { type: 'milestone_approved', payload: { player_id: WALLET_A } },
+        { type: 'milestone_approved', payload: { player_id: PLAYER_1 } },
         WALLET_A,
+        PLAYER_1,
       )).toBe(true);
     });
 
-    it('returns false when player_id is a different wallet', () => {
+    it('returns false when player_id does not match the wallet owner player ID', () => {
       expect(isEventRelevantToWallet(
-        { type: 'milestone_approved', payload: { player_id: WALLET_B } },
+        { type: 'milestone_approved', payload: { player_id: PLAYER_1 } },
         WALLET_A,
+        'player-cuid-2',
       )).toBe(false);
     });
 
@@ -97,17 +100,19 @@ describe('isEventRelevantToWallet', () => {
       )).toBe(true);
     });
 
-    it('returns true when player_id matches wallet', () => {
+    it('returns true when player_id matches the wallet owner player ID', () => {
       expect(isEventRelevantToWallet(
-        { type: 'trial_offer_logged', payload: { scout: WALLET_A, player_id: WALLET_B } },
+        { type: 'trial_offer_logged', payload: { scout: WALLET_A, player_id: PLAYER_1 } },
         WALLET_B,
+        PLAYER_1,
       )).toBe(true);
     });
 
     it('returns false for an unrelated wallet', () => {
       expect(isEventRelevantToWallet(
-        { type: 'trial_offer_logged', payload: { scout: WALLET_A, player_id: WALLET_B } },
+        { type: 'trial_offer_logged', payload: { scout: WALLET_A, player_id: PLAYER_1 } },
         WALLET_C,
+        'player-cuid-2',
       )).toBe(false);
     });
   });
@@ -120,10 +125,11 @@ describe('isEventRelevantToWallet', () => {
       )).toBe(true);
     });
 
-    it('returns true when player_id matches', () => {
+    it('returns true when player_id matches the wallet owner player ID', () => {
       expect(isEventRelevantToWallet(
-        { type: 'player_registered', payload: { wallet: WALLET_B, player_id: WALLET_A } },
+        { type: 'player_registered', payload: { wallet: WALLET_B, player_id: PLAYER_1 } },
         WALLET_A,
+        PLAYER_1,
       )).toBe(true);
     });
 
@@ -136,10 +142,11 @@ describe('isEventRelevantToWallet', () => {
   });
 
   describe('milestone_submitted', () => {
-    it('returns true when player_id matches', () => {
+    it('returns true when player_id matches the wallet owner player ID', () => {
       expect(isEventRelevantToWallet(
-        { type: 'milestone_submitted', payload: { player_id: WALLET_A, validator: WALLET_B } },
+        { type: 'milestone_submitted', payload: { player_id: PLAYER_1, validator: WALLET_B } },
         WALLET_A,
+        PLAYER_1,
       )).toBe(true);
     });
 
@@ -185,10 +192,14 @@ describe('isEventRelevantToWallet', () => {
 // ─── EventBroadcaster lifecycle ───────────────────────────────────────────────
 
 describe('EventBroadcaster', () => {
-  function makeSub(wallet: string): SseSubscriber & { received: BroadcastEvent[] } {
+  function makeSub(
+    wallet: string,
+    playerId?: string,
+  ): SseSubscriber & { received: BroadcastEvent[] } {
     const received: BroadcastEvent[] = [];
     const sub: SseSubscriber & { received: BroadcastEvent[] } = {
       wallet,
+      playerId,
       received,
       send(event: BroadcastEvent) { received.push(event); },
     };
@@ -207,7 +218,7 @@ describe('EventBroadcaster', () => {
 
   it('subscriberCount increments on subscribe', () => {
     const inst = EventBroadcaster.getInstance();
-    const sub = makeSub(WALLET_A);
+    const sub = makeSub(WALLET_A, PLAYER_1);
     inst.subscribe(sub);
     expect(inst.subscriberCount).toBe(1);
     inst.unsubscribe(sub);
@@ -221,14 +232,31 @@ describe('EventBroadcaster', () => {
     expect(inst.subscriberCount).toBe(0);
   });
 
+  it('counts active subscribers by authenticated wallet', () => {
+    const inst = EventBroadcaster.getInstance();
+    const subA = makeSub(WALLET_A);
+    const subA2 = makeSub(WALLET_A);
+    const subB = makeSub(WALLET_B);
+    inst.subscribe(subA);
+    inst.subscribe(subA2);
+    inst.subscribe(subB);
+
+    expect(inst.getSubscriberCountForWallet(WALLET_A)).toBe(2);
+    expect(inst.getSubscriberCountForWallet(WALLET_B)).toBe(1);
+
+    inst.unsubscribe(subA);
+    inst.unsubscribe(subA2);
+    inst.unsubscribe(subB);
+  });
+
   it('delivers a relevant event to a subscriber', () => {
     const inst = EventBroadcaster.getInstance();
-    const sub = makeSub(WALLET_A);
+    const sub = makeSub(WALLET_A, PLAYER_1);
     inst.subscribe(sub);
 
     const event: BroadcastEvent = {
       type: 'milestone_approved',
-      payload: { player_id: WALLET_A },
+      payload: { player_id: PLAYER_1 },
     };
     inst.broadcast(event);
 
@@ -239,12 +267,12 @@ describe('EventBroadcaster', () => {
 
   it('does NOT deliver an irrelevant event to a subscriber', () => {
     const inst = EventBroadcaster.getInstance();
-    const sub = makeSub(WALLET_A);
+    const sub = makeSub(WALLET_A, PLAYER_1);
     inst.subscribe(sub);
 
     inst.broadcast({
       type: 'milestone_approved',
-      payload: { player_id: WALLET_B }, // different wallet
+      payload: { player_id: 'player-cuid-2' }, // different player
     });
 
     expect(sub.received).toHaveLength(0);
@@ -254,7 +282,7 @@ describe('EventBroadcaster', () => {
   it('delivers to WALLET_A and not WALLET_B when both are subscribed', () => {
     const inst = EventBroadcaster.getInstance();
     const subA = makeSub(WALLET_A);
-    const subB = makeSub(WALLET_B);
+    const subB = makeSub(WALLET_B, 'player-cuid-2');
     inst.subscribe(subA);
     inst.subscribe(subB);
 
@@ -273,13 +301,13 @@ describe('EventBroadcaster', () => {
   it('delivers to both subscribers when both are relevant', () => {
     const inst = EventBroadcaster.getInstance();
     const subA = makeSub(WALLET_A);
-    const subB = makeSub(WALLET_B);
+    const subB = makeSub(WALLET_B, 'player-cuid-2');
     inst.subscribe(subA);
     inst.subscribe(subB);
 
     inst.broadcast({
       type: 'trial_offer_logged',
-      payload: { scout: WALLET_A, player_id: WALLET_B },
+      payload: { scout: WALLET_A, player_id: 'player-cuid-2' },
     });
 
     expect(subA.received).toHaveLength(1);
@@ -291,13 +319,13 @@ describe('EventBroadcaster', () => {
 
   it('does not deliver events to a subscriber after unsubscribe', () => {
     const inst = EventBroadcaster.getInstance();
-    const sub = makeSub(WALLET_A);
+    const sub = makeSub(WALLET_A, PLAYER_1);
     inst.subscribe(sub);
     inst.unsubscribe(sub);
 
     inst.broadcast({
       type: 'milestone_approved',
-      payload: { player_id: WALLET_A },
+      payload: { player_id: PLAYER_1 },
     });
 
     expect(sub.received).toHaveLength(0);
@@ -305,10 +333,10 @@ describe('EventBroadcaster', () => {
 
   it('handles multiple broadcasts correctly', () => {
     const inst = EventBroadcaster.getInstance();
-    const sub = makeSub(WALLET_A);
+    const sub = makeSub(WALLET_A, PLAYER_1);
     inst.subscribe(sub);
 
-    inst.broadcast({ type: 'milestone_approved', payload: { player_id: WALLET_A } });
+    inst.broadcast({ type: 'milestone_approved', payload: { player_id: PLAYER_1 } });
     inst.broadcast({ type: 'scout_subscribed', payload: { scout: WALLET_A } });
     inst.broadcast({ type: 'contact_unlocked', payload: { scout: WALLET_A, player_id: 'p1' } });
     inst.broadcast({ type: 'player_registered', payload: { wallet: WALLET_B } }); // irrelevant
@@ -321,12 +349,13 @@ describe('EventBroadcaster', () => {
     const inst = EventBroadcaster.getInstance();
     const throwingSub: SseSubscriber = {
       wallet: WALLET_A,
+      playerId: PLAYER_1,
       send() { throw new Error('stream closed'); },
     };
     inst.subscribe(throwingSub);
 
     expect(() => {
-      inst.broadcast({ type: 'milestone_approved', payload: { player_id: WALLET_A } });
+      inst.broadcast({ type: 'milestone_approved', payload: { player_id: PLAYER_1 } });
     }).not.toThrow();
 
     inst.unsubscribe(throwingSub);
@@ -334,7 +363,7 @@ describe('EventBroadcaster', () => {
 
   it('_resetForTests gives a fresh instance', () => {
     const inst1 = EventBroadcaster.getInstance();
-    const sub = makeSub(WALLET_A);
+    const sub = makeSub(WALLET_A, PLAYER_1);
     inst1.subscribe(sub);
     expect(inst1.subscriberCount).toBe(1);
 

@@ -25,9 +25,10 @@ import {
 import { deriveApiKeyLookupHash } from '../../src/utils/apiKeyLookup';
 
 const SCOUT = 'GAAKO6EK5AIJWZH7ITXBFZTPASYKPY3YVMFVFVD5UDG2C6NUIXTT7BE3';
+const SCALE_SCOUT = `${SCOUT}:scale`;
 
 /** Issue a key straight into the real database, exactly as the controller does. */
-async function issueKey(opts: { scopes?: string[]; wallet?: string } = {}): Promise<{
+async function issueKey(opts: { scopes?: string[] } = {}): Promise<{
   id: number;
   key: string;
   lookupHash: string;
@@ -35,13 +36,22 @@ async function issueKey(opts: { scopes?: string[]; wallet?: string } = {}): Prom
   const { key, keyHash, lookupHash } = generateApiKey();
   const id = await db.insertApiKey({
     key_hash: keyHash,
-    scout_wallet: opts.wallet ?? SCOUT,
+    scout_wallet: SCOUT,
     label: 'scale-fixture',
     created_at: Math.floor(Date.now() / 1000),
     scopes: opts.scopes,
     lookup_hash: lookupHash,
   });
   return { id, key, lookupHash };
+}
+
+function seedScaleKey(): { id: number; key: string; lookupHash: string } {
+  const { key, keyHash, lookupHash } = generateApiKey();
+  const info = db.getDb().prepare(`
+    INSERT INTO api_keys (key_hash, scout_wallet, label, created_at, lookup_hash)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(keyHash, SCALE_SCOUT, 'scale-fixture', Math.floor(Date.now() / 1000), lookupHash);
+  return { id: Number(info.lastInsertRowid), key, lookupHash };
 }
 
 /** Read one row's stored lookup_hash directly, without listing the whole table. */
@@ -54,12 +64,15 @@ function storedLookupHash(id: number): string | null {
 }
 
 /** Count rows in api_keys without materialising them. */
-function apiKeyCount(): number {
-  return (db.getDb().prepare('SELECT COUNT(*) AS n FROM api_keys').get() as { n: number }).n;
+function apiKeyCount(wallet: string): number {
+  return (db.getDb()
+    .prepare('SELECT COUNT(*) AS n FROM api_keys WHERE scout_wallet = ?')
+    .get(wallet) as { n: number }).n;
 }
 
-afterEach(() => {
+afterEach(async () => {
   jest.restoreAllMocks();
+  await db.getDriver().run('DELETE FROM api_keys WHERE scout_wallet IN (?, ?)', [SCOUT, SCALE_SCOUT]);
 });
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -190,21 +203,21 @@ describe('resolution cost does not grow with the number of stored keys (#1033)',
     // implementation pay for a full table read plus n SHA-256 computations.
     let target: { id: number; key: string; lookupHash: string } | null = null;
     for (let i = 0; i < KEY_COUNT; i++) {
-      const issued = await issueKey();
+      const issued = seedScaleKey();
       // Pick a key from the middle so neither insertion order nor row id
       // could make this accidentally cheap.
       if (i === Math.floor(KEY_COUNT / 2)) target = issued;
     }
     expect(target).not.toBeNull();
 
-    expect(apiKeyCount()).toBeGreaterThanOrEqual(KEY_COUNT);
+    expect(apiKeyCount(SCALE_SCOUT)).toBe(KEY_COUNT);
 
     const byLookup = jest.spyOn(db, 'getActiveApiKeyByLookupHash');
     const scan = jest.spyOn(db, 'getActiveApiKeysAwaitingLookupHash');
 
     const resolved = await resolveApiKey(target!.key);
 
-    expect(resolved).toEqual({ scout_wallet: SCOUT, id: target!.id, scopes: null });
+    expect(resolved).toEqual({ scout_wallet: SCALE_SCOUT, id: target!.id, scopes: null });
     // ONE candidate row considered, regardless of KEY_COUNT.
     expect(byLookup).toHaveBeenCalledTimes(1);
     expect(scan).not.toHaveBeenCalled();

@@ -79,6 +79,50 @@ describe('indexEvents — milestone_approved webhook dispatch', () => {
     expect(mockedDispatch).toHaveBeenCalledWith('milestone_approved', { player_id: 'P3' });
   });
 
+  it('does not repeat side effects when a poll returns an already-indexed event', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const dbModule = require('../../src/db');
+    const updateProgressSpy = jest.spyOn(dbModule, 'updatePlayerProgress');
+    const event = makeEvent(
+      'milestone_approved',
+      { player_id: 'P-REPLAY' },
+      `hash-replay-${Math.random().toString(36).slice(2)}`,
+      200_000 + Math.floor(Math.random() * 100_000),
+    );
+    server.getEvents.mockResolvedValue({ latestLedger: event.ledger, events: [event] });
+
+    await indexEvents();
+    await indexEvents();
+
+    expect(updateProgressSpy).toHaveBeenCalledTimes(1);
+    expect(mockedInvalidatePlayerCache).toHaveBeenCalledTimes(1);
+    expect(mockedDispatch).toHaveBeenCalledTimes(1);
+    updateProgressSpy.mockRestore();
+  });
+
+  it('counts approvals per player without scanning all stored approvals', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const dbModule = require('../../src/db');
+    const queryEventsSpy = jest.spyOn(dbModule, 'queryEvents');
+    const countSpy = jest.spyOn(dbModule, 'getEventsCount');
+    server.getEvents.mockResolvedValue({
+      events: [
+        makeEvent('milestone_approved', { player_id: 'P-COUNT' }, 'hash-count-001', 120),
+        makeEvent('milestone_approved', { player_id: 'P-COUNT' }, 'hash-count-002', 121),
+        makeEvent('milestone_approved', { player_id: 'P-COUNT' }, 'hash-count-003', 122),
+      ],
+    });
+
+    await indexEvents();
+
+    expect(queryEventsSpy).not.toHaveBeenCalledWith('milestone_approved');
+    expect(countSpy).toHaveBeenCalledWith('milestone_approved', {
+      payloadFilter: { player_id: 'P-COUNT' },
+    });
+    queryEventsSpy.mockRestore();
+    countSpy.mockRestore();
+  });
+
   it('does not dispatch a webhook for non-milestone_approved events', async () => {
     server.getEvents.mockResolvedValue({
       events: [makeEvent('player_registered', { player_id: 'P1', wallet: 'GWALLETP1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' }, 'hash-005')],
@@ -206,6 +250,69 @@ describe('indexEvents — milestone_approved webhook dispatch', () => {
     // and the next poll re-fetches and reprocesses this same batch from the
     // chain (safe, since every write above is idempotent).
     expect(fetchLastIndexedLedger()).toBe(beforeLedger);
+  });
+});
+
+describe('indexEvents — API/on-chain player ID mapping', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('links a pending API player from player_rg and maps later milestone IDs to its CUID', async () => {
+    const { Address, Keypair, nativeToScVal } = require('@stellar/stellar-sdk');
+    const {
+      getPlayerById,
+      insertOrUpdatePlayer,
+      persistLastIndexedLedger,
+      queryEvents,
+    } = require('../../src/db');
+    const apiPlayerId = `pending-${Math.random().toString(36).slice(2)}`;
+    const wallet = Keypair.random().publicKey();
+    const validator = Keypair.random().publicKey();
+    const onChainPlayerId = 987654321n;
+    const onChainPlayerIdString = onChainPlayerId.toString();
+    await insertOrUpdatePlayer({ player_id: apiPlayerId, wallet });
+    persistLastIndexedLedger(0);
+
+    server.getEvents.mockResolvedValue({
+      latestLedger: 502,
+      events: [
+        {
+          topic: [
+            nativeToScVal('player_rg', { type: 'symbol' }),
+            Address.fromString(wallet).toScVal(),
+          ],
+          value: nativeToScVal([onChainPlayerId, 'ipfs://meta', 'forward', 'europe']),
+          ledger: 500,
+          txHash: 'player-register-mapping-tx',
+          eventIndex: 0,
+        },
+        {
+          topic: [
+            nativeToScVal('milestone_submitted', { type: 'symbol' }),
+            Address.fromString(validator).toScVal(),
+            nativeToScVal(onChainPlayerId, { type: 'u64' }),
+          ],
+          value: nativeToScVal([11n, 'identity', 'ipfs://evidence']),
+          ledger: 501,
+          txHash: 'milestone-mapping-tx',
+          eventIndex: 0,
+        },
+      ],
+    });
+
+    await indexEvents();
+
+    expect((await getPlayerById(apiPlayerId)).on_chain_player_id).toBe(onChainPlayerIdString);
+    const milestone = queryEvents('milestone_submitted').find(
+      (event: { payload: Record<string, unknown> }) => event.payload.milestone_id === '11',
+    );
+    expect(milestone?.payload).toMatchObject({
+      player_id: apiPlayerId,
+      on_chain_player_id: onChainPlayerIdString,
+      milestone_type: 'identity',
+      evidence_uri: 'ipfs://evidence',
+    });
   });
 });
 

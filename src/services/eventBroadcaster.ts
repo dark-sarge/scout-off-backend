@@ -34,6 +34,8 @@ export interface SseFilterCriteria {
  */
 export interface SseSubscriber {
   wallet: string;
+  /** Cuid2 player identity associated with this authenticated wallet, if any. */
+  playerId?: string;
   /** Optional server-side filter criteria for this connection. */
   filter?: SseFilterCriteria;
   send: (event: BroadcastEvent) => void;
@@ -44,22 +46,18 @@ export interface SseSubscriber {
 // Determines whether a broadcast event is relevant to a given wallet.
 // Rules (no cross-tenant leakage):
 //
-//   milestone_approved  → relevant when payload.player_id matches a player's own
-//                         wallet OR when the player_id column of the players table
-//                         is owned by that wallet. Because the indexer does NOT
-//                         carry a wallet field on milestone events we match on
-//                         player_id === wallet as a convention used throughout the
-//                         codebase, and also broadcast to any subscriber whose
-//                         wallet matches the scout_wallet / wallet field present
-//                         in the payload.
+//   milestone_approved  → relevant when payload.player_id matches the
+//                         subscriber's associated player ID, or a wallet field
+//                         in the payload matches the subscriber wallet.
 //
 //   scout_subscribed    → relevant when payload.scout (scout wallet) matches.
 //   contact_unlocked    → relevant when payload.scout (scout wallet) matches.
 //   trial_offer_logged  → relevant when payload.scout matches (scout) or
-//                         payload.player_id matches (player).
-//   player_registered   → relevant when payload.wallet matches.
-//   milestone_submitted → relevant when payload.player_id matches or
-//                         payload.validator matches.
+//                         payload.player_id matches the subscriber's player ID.
+//   player_registered   → relevant when payload.wallet matches or the player ID
+//                         matches the subscriber's player ID.
+//   milestone_submitted → relevant when payload.player_id matches the
+//                         subscriber's player ID or payload.validator matches.
 //   fees_withdrawn      → relevant when payload.recipient matches (admin).
 //
 // In practice clients only need milestone_approved, scout_subscribed, and
@@ -69,6 +67,7 @@ export interface SseSubscriber {
 export function isEventRelevantToWallet(
   event: BroadcastEvent,
   wallet: string,
+  playerId?: string,
 ): boolean {
   const p = event.payload;
 
@@ -76,7 +75,7 @@ export function isEventRelevantToWallet(
     case 'milestone_approved':
       // Broadcast to the player who owns the milestone and to scouts watching.
       return (
-        p.player_id === wallet ||
+        (playerId !== undefined && p.player_id === playerId) ||
         p.wallet === wallet ||
         p.scout === wallet
       );
@@ -88,28 +87,30 @@ export function isEventRelevantToWallet(
       return p.scout === wallet || p.wallet === wallet;
 
     case 'trial_offer_logged':
-      return p.scout === wallet || p.player_id === wallet;
+      return p.scout === wallet || (playerId !== undefined && p.player_id === playerId);
 
     case 'trial_offer_accepted':
     case 'trial_offer_rejected':
       // Notify the scout who made the offer and the player who responded.
-      return p.scout === wallet || p.player_id === wallet;
+      return p.scout === wallet || (playerId !== undefined && p.player_id === playerId);
 
     case 'player_registered':
-      return p.wallet === wallet || p.player_id === wallet;
+      return p.wallet === wallet || (playerId !== undefined && p.player_id === playerId);
 
     case 'milestone_submitted':
-      return p.player_id === wallet || p.validator === wallet;
+      return (playerId !== undefined && p.player_id === playerId) || p.validator === wallet;
 
     case 'fees_withdrawn':
       return p.recipient === wallet || p.wallet === wallet;
 
     case 'player_deactivated':
       // Notify the player themselves and any scout who unlocked their contact.
-      return p.player_id === wallet || p.wallet === wallet || p.scout_wallet === wallet;
+      return (playerId !== undefined && p.player_id === playerId) ||
+        p.wallet === wallet ||
+        p.scout_wallet === wallet;
 
     case 'player_reactivated':
-      return p.player_id === wallet || p.wallet === wallet;
+      return (playerId !== undefined && p.player_id === playerId) || p.wallet === wallet;
 
     default:
       return false;
@@ -242,6 +243,15 @@ export class EventBroadcaster extends EventEmitter {
     return this._subscribers.size;
   }
 
+  /** Number of currently connected subscribers authenticated as this wallet. */
+  getSubscriberCountForWallet(wallet: string): number {
+    let count = 0;
+    for (const subscriber of this._subscribers) {
+      if (subscriber.wallet === wallet) count += 1;
+    }
+    return count;
+  }
+
   /**
    * Set up Redis pub/sub if configured.
    * Reads from the singleton instance to avoid circular dependency.
@@ -291,7 +301,7 @@ export class EventBroadcaster extends EventEmitter {
     const listener = (event: BroadcastEvent) => {
       try {
         if (
-          isEventRelevantToWallet(event, subscriber.wallet) &&
+          isEventRelevantToWallet(event, subscriber.wallet, subscriber.playerId) &&
           isEventMatchingFilter(event, subscriber.filter)
         ) {
           subscriber.send(event);
@@ -376,5 +386,3 @@ export class EventBroadcaster extends EventEmitter {
 /** Convenience accessor for the singleton. */
 export const broadcaster = EventBroadcaster.getInstance();
 
-/** Export metrics helpers for tests and monitoring. */
-export { _resetMetrics, _getMetrics };

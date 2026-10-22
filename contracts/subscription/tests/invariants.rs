@@ -19,12 +19,12 @@
 #[cfg(test)]
 mod subscription_invariants {
     use proptest::prelude::*;
-    use subscription::{SubscriptionContract, SubscriptionContractClient};
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
         token::StellarAssetClient,
         Address, Env,
     };
+    use subscription::{SubscriptionContract, SubscriptionContractClient};
 
     /// Any scout balance used in these tests only needs to cover subscribe()/
     /// pay_to_contact() fees — one mint per scout is enough per test case.
@@ -59,7 +59,9 @@ mod subscription_invariants {
         // the "token" address must be a live Stellar Asset Contract, not a bare
         // generated Address — otherwise every transfer call traps with
         // Error(Storage, MissingValue) (no contract instance to invoke).
-        let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let token = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
         client.initialize(&admin, &token, &100u32);
         (client, admin, token)
     }
@@ -352,12 +354,12 @@ mod subscription_invariants {
 #[cfg(test)]
 mod subscription_lifecycle_invariants {
     use proptest::prelude::*;
-    use subscription::{SubscriptionContract, SubscriptionContractClient};
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
         token::StellarAssetClient,
         Address, Env,
     };
+    use subscription::{SubscriptionContract, SubscriptionContractClient};
 
     const LEDGERS_PER_DAY: u32 = 17_280;
     const SCOUT_FUNDING: i128 = 1_000_000_000_000_000i128;
@@ -374,7 +376,9 @@ mod subscription_lifecycle_invariants {
         let id = env.register_contract(None, SubscriptionContract);
         let client = SubscriptionContractClient::new(env, &id);
         let admin = Address::generate(env);
-        let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let token = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
         client.initialize(&admin, &token, &500u32);
         (client, admin, token)
     }

@@ -94,7 +94,7 @@ describe('POST /auth/token — admin role pre-verification regression (#694)', (
     // Construct a transaction XDR whose first operation's source is an admin wallet,
     // but which is NOT signed by that wallet.  Without the fix this could (in a
     // fragile code path) return a token before signature verification runs.
-    // With the fix, role determination only happens from verifyAndIssueToken()'s
+    // With the fix, role determination only happens from verifyChallenge()'s
     // verified account — so any signature failure produces a 401, not an admin token.
     const malformedXdr = 'AAAAAQAAAAAAAAAA'; // short / invalid XDR
     const res = await request(app)
@@ -122,3 +122,22 @@ describe('POST /auth/token — admin role pre-verification regression (#694)', (
     expect(res.body.token).toBeUndefined();
   });
 });
+
+describe('Cache-Control and Pragma headers on /auth/*', () => {
+  it('sets Cache-Control: no-store and Pragma: no-cache on /auth/token responses', async () => {
+    const res = await request(app)
+      .post('/auth/token')
+      .send({ transaction: 'this-is-not-valid-xdr' });
+    expect(res.headers['cache-control']).toBe('no-store');
+    expect(res.headers['pragma']).toBe('no-cache');
+  });
+
+  it('sets Cache-Control: no-store and Pragma: no-cache on /auth/refresh responses', async () => {
+    const res = await request(app)
+      .post('/auth/refresh')
+      .send({});
+    expect(res.headers['cache-control']).toBe('no-store');
+    expect(res.headers['pragma']).toBe('no-cache');
+  });
+});
+

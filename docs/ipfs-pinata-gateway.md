@@ -136,3 +136,28 @@ IPFS_GATEWAYS=https://my-ipfs-1.example.com,https://my-ipfs-2.example.com,https:
 **Specific Gateway Not Being Used**
 - If `IPFS_GATEWAYS` is set, `PINATA_GATEWAY` is **ignored** for retrieval (only validated).
 - To use a specific gateway, ensure it's in `IPFS_GATEWAYS` or set it as `PINATA_GATEWAY` with `IPFS_GATEWAYS` unset.
+
+## HTTPS evidence downloads (SSRF protection, #1331)
+
+When a validator submits an `https://` `evidenceUri`, the backend downloads it
+through the shared SSRF-safe fetcher in `src/utils/safeFetch.ts` before pinning
+it to Pinata:
+
+- **Address checks** — the hostname is resolved and rejected with **422** if any
+  answer is loopback, private (10/8, 172.16/12, 192.168/16), link-local /
+  cloud metadata (169.254/16), CGNAT (100.64/10), multicast, reserved, IPv6
+  ULA (fc00::/7), IPv6 link-local, or an IPv4-mapped IPv6 form of those. The
+  validated IP is pinned for the connection, so DNS rebinding cannot swap it.
+- **Redirects** — never followed automatically. Up to 3 hops are followed
+  manually; every hop must be `https://` and passes the same address checks.
+- **Size** — the body is streamed and aborted as soon as it exceeds
+  `EVIDENCE_MAX_BYTES` (**413**), so memory stays bounded.
+- **Content sniffing** — the file's magic bytes must identify an accepted type
+  (image/*, video/*, application/pdf, text/plain) and agree with the declared
+  `Content-Type`; e.g. HTML served as `image/png` is rejected with **422**.
+- **Budget & timeouts** — each validator may download at most
+  `EVIDENCE_VALIDATOR_BYTES_PER_HOUR` bytes (default 500 MiB) per hour
+  (**429** once exhausted). Downloads time out after 30 s (**504**); upstream
+  network failures return **502**.
+- **Metrics** — rejections are counted in
+  `evidence_download_rejected_total{reason="..."}` on `/metrics`.

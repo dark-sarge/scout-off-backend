@@ -5,6 +5,7 @@ import { InMemoryRateLimitStore } from './inMemoryRateLimitStore';
 import { RedisRateLimitStore } from './redisRateLimitStore';
 import { getRedisClient } from '../services/redis';
 import { logger } from '../utils/logger';
+import { ErrorCode } from '../utils/errorCodes';
 
 function createStore(): RateLimitStore {
   const redis = getRedisClient();
@@ -20,6 +21,8 @@ export interface RateLimitOptions {
   windowMs?: number; // time window in ms (default: config.rateLimit.windowMs)
   max?: number;      // max requests per window per IP (default: config.rateLimit.max)
   store?: RateLimitStore; // override default store (useful for tests)
+  /** Return a stable subject key instead of the request IP for identity-based limits. */
+  keyGenerator?: (req: Request) => string | undefined;
   /**
    * Namespace distinguishing this limiter's counters from every other
    * rateLimit() instance sharing the same default store. Without this,
@@ -71,13 +74,18 @@ export function rateLimit(options: RateLimitOptions = {}) {
     const ip = req.ip ?? 'unknown';
 
     try {
-      const { count, resetAt } = await store.increment(`${namespace}:ip:${ip}`, windowMs);
+      const key = options.keyGenerator?.(req) || `ip:${ip}`;
+      const { count, resetAt } = await store.increment(`${namespace}:${key}`, windowMs);
 
       if (count > max) {
         const now = Date.now();
         const retryAfterSec = Math.ceil(Math.max(0, resetAt - now) / 1000);
         res.set('Retry-After', String(retryAfterSec || 1));
-        res.status(429).json({ success: false, error: 'Too many requests, please try again later' });
+        res.status(429).json({
+          success: false,
+          error: 'Too many requests, please try again later',
+          code: ErrorCode.RATE_LIMITED,
+        });
         return;
       }
       next();
@@ -133,6 +141,7 @@ export function playerRateLimit(options: RateLimitOptions = {}) {
         res.status(429).json({
           success: false,
           error: 'Too many milestone submissions for this player, please try again later',
+          code: ErrorCode.RATE_LIMITED,
         });
         return;
       }
@@ -176,10 +185,17 @@ export function walletRateLimit(options: RateLimitOptions = {}) {
     }
 
     try {
-      const { count } = await store.increment(`${namespace}:wallet:${wallet}`, windowMs);
+      const { count, resetAt } = await store.increment(`${namespace}:wallet:${wallet}`, windowMs);
 
       if (count > max) {
-        res.status(429).json({ success: false, error: 'Too many requests, please try again later' });
+        const now = Date.now();
+        const retryAfterSec = Math.ceil(Math.max(0, resetAt - now) / 1000);
+        res.set('Retry-After', String(retryAfterSec || 1));
+        res.status(429).json({
+          success: false,
+          error: 'Too many requests, please try again later',
+          code: ErrorCode.RATE_LIMITED,
+        });
         return;
       }
       next();

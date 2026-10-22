@@ -4,7 +4,6 @@
  * Tests the complete flow from HTTP request through multisig to execution
  */
 
-import { jest } from '@jest/globals';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
 import { Keypair } from '@stellar/stellar-sdk';

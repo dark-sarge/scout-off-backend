@@ -112,7 +112,7 @@ export function publishSseEvent(event: {
   const channel = 'sse:events';
   const message = JSON.stringify(event);
   try {
-    client.PUBLISH(channel, message);
+    client.publish(channel, message);
     return true;
   } catch (err) {
     logger.warn(`[redis] failed to publish event to ${channel}: ${err instanceof Error ? err.message : String(err)}`);

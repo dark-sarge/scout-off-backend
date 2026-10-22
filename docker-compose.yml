@@ -5,6 +5,8 @@ services:
       dockerfile: Dockerfile
       args:
         GIT_COMMIT: ${GIT_COMMIT:-unknown}
+        VERSION: ${VERSION:-1.0.0}
+        BUILD_DATE: ${BUILD_DATE:-}
     image: scout-off-backend:local
     container_name: scout-off-backend
     restart: unless-stopped

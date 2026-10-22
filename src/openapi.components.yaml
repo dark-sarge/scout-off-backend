@@ -75,6 +75,11 @@ components:
       description: Stellar public key (G…)
 
   schemas:
+    ErrorCode:
+      type: string
+      description: Machine-readable error code returned in API responses.
+      enum:
+        - REQUEST_TIMEOUT
     # ── Envelope ──────────────────────────────────────────────────────────────
     SuccessEnvelope:
       type: object
@@ -103,6 +108,14 @@ components:
       properties:
         player_id:
           type: string
+          description: API player identifier (cuid2)
+        on_chain_player_id:
+          type: string
+          nullable: true
+          description: Sequential u64 ID assigned by the register contract; null while registration is pending
+        registration_status:
+          type: string
+          enum: [pending, registered]
         wallet:
           type: string
         position:

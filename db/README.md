@@ -52,6 +52,6 @@ Two things follow from that:
 3. If the migration needs to be reversible, add matching `.down.sql` files
    (see existing `*.down.sql` files for examples) — these are excluded from
    the forward-migration file list and only read when rolling back.
-4. Run `npm run migration:status` to confirm both files are picked up as
-   pending, then apply them locally to verify they succeed against both
-   drivers before opening a PR.
+4. Run `npm run migration:status` to confirm the forward-migration files are
+   listed (rollback `.down.sql` files are excluded), then apply them locally
+   to verify they succeed against both drivers before opening a PR.

@@ -35,7 +35,6 @@ import { useValidationRule } from '@envelop/core';
 import request from 'supertest';
 import express from 'express';
 import jwt from 'jsonwebtoken';
-import { GraphQLError, Kind } from 'graphql';
 import {
   getPlayerById,
   queryPlayers,
@@ -47,6 +46,7 @@ import { queryMilestones } from '../../src/services/stellar';
 import { typeDefs } from '../../src/graphql/schema';
 import { resolvers } from '../../src/graphql/resolvers';
 import { createContext } from '../../src/graphql/context';
+import { createBlockIntrospectionPlugin } from '../../src/graphql';
 // Shared validation rules — single source of truth with src/graphql/index.ts.
 import {
   createDepthLimitRule,
@@ -54,36 +54,6 @@ import {
   MAX_DEPTH,
   MAX_QUERY_COST,
 } from '../../src/graphql/validation';
-
-// ─── Production introspection-blocking plugin (mirrors src/graphql/index.ts) ─
-
-function createBlockIntrospectionPlugin() {
-  return {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    onExecute({ args, setResultAndStopExecution }: any) {
-      const defs: readonly import('graphql').DefinitionNode[] =
-        args?.document?.definitions ?? [];
-      for (const def of defs) {
-        if (def.kind !== Kind.OPERATION_DEFINITION) continue;
-        for (const sel of (def as import('graphql').OperationDefinitionNode).selectionSet.selections) {
-          if (
-            sel.kind === Kind.FIELD &&
-            (sel.name.value === '__schema' || sel.name.value === '__type')
-          ) {
-            setResultAndStopExecution({
-              errors: [
-                new GraphQLError('GraphQL introspection is disabled in production.', {
-                  extensions: { code: 'INTROSPECTION_DISABLED' },
-                }),
-              ],
-            });
-            return;
-          }
-        }
-      }
-    },
-  };
-}
 
 // ─── Typed mocks ──────────────────────────────────────────────────────────────
 
@@ -679,12 +649,16 @@ describe('GraphQL — introspection', () => {
     expect(res.body.data?.__schema?.queryType?.name).toBe('Query');
   });
 
-  it('rejects introspection in production mode', async () => {
+  it.each([
+    `{ __schema { queryType { name } } }`,
+    `query { ...SchemaFields } fragment SchemaFields on Query { __schema { types { name } } }`,
+    `query { ... on Query { __type(name: "Query") { name } } }`,
+  ])('rejects direct and fragment-based introspection in production: %s', async (query) => {
     const app = buildApp({ production: true });
 
     const res = await request(app)
       .post('/graphql')
-      .send({ query: `{ __schema { queryType { name } } }` });
+      .send({ query });
 
     // The introspection-blocking plugin stops execution and returns an error.
     // graphql-yoga may return 400/500 for execution errors — we care about the

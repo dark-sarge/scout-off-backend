@@ -7,9 +7,15 @@ describe('config NODE_ENV toggles', () => {
   const originalPlatformSecretKey = process.env.PLATFORM_SECRET_KEY;
   const originalSep10ServerSecret = process.env.SEP10_SERVER_SECRET;
   const originalApiKeyLookupSecret = process.env.API_KEY_LOOKUP_SECRET;
+  const originalJwtSecret = process.env.JWT_SECRET;
 
   afterEach(() => {
     process.env.NODE_ENV = originalEnv;
+    if (originalJwtSecret !== undefined) {
+      process.env.JWT_SECRET = originalJwtSecret;
+    } else {
+      delete process.env.JWT_SECRET;
+    }
     if (originalAdminWallet !== undefined) {
       process.env.ADMIN_WALLET = originalAdminWallet;
     } else {
@@ -38,6 +44,8 @@ describe('config NODE_ENV toggles', () => {
     // Ensure ADMIN_WALLET is set when loading production/staging config
     if (env === 'production' || env === 'staging') {
       process.env.ADMIN_WALLET = 'GADMINWALLET1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+      // Placeholder secrets like 'test-secret' are rejected outside dev/test.
+      process.env.JWT_SECRET = 'k8Zq3vN1pW7xR4tY9bM2cF6hJ0lD5sGaQe';
     }
     // PLATFORM_SECRET_KEY is required in every non-test environment
     if (env !== 'test') {
@@ -58,6 +66,8 @@ describe('config NODE_ENV toggles', () => {
     process.env.NODE_ENV = env;
     if (env === 'production' || env === 'staging') {
       process.env.ADMIN_WALLET = 'GADMINWALLET1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+      // Placeholder secrets like 'test-secret' are rejected outside dev/test.
+      process.env.JWT_SECRET = 'k8Zq3vN1pW7xR4tY9bM2cF6hJ0lD5sGaQe';
     }
     if (env !== 'test') {
       process.env.PLATFORM_SECRET_KEY = 'SPLATFORMSECRETKEY1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
@@ -334,9 +344,14 @@ describe('parseNumericEnv validation', () => {
     'RATE_LIMIT_MAX',
     'AUTH_RATE_LIMIT_WINDOW_MS',
     'AUTH_RATE_LIMIT_MAX',
+    'AUTH_RATE_LIMIT_IP_MAX',
     'PLAYER_IMPORT_RATE_LIMIT_WINDOW_MS',
     'PLAYER_IMPORT_RATE_LIMIT_MAX',
     'REQUEST_TIMEOUT_MS',
+    'SQLITE_BUSY_TIMEOUT_MS',
+    'DB_STATEMENT_TIMEOUT_MS',
+    'DB_QUERY_TIMEOUT_MS',
+    'DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS',
     'LOG_SAMPLE_RATE',
     'SUBSCRIPTION_GRACE_PERIOD_HOURS',
     'PLAYER_CACHE_TTL_MS',
@@ -499,6 +514,23 @@ describe('parseNumericEnv validation', () => {
   it('REQUEST_TIMEOUT_MS: 0 is below min (1) and throws naming REQUEST_TIMEOUT_MS', async () => {
     process.env.REQUEST_TIMEOUT_MS = '0';
     await expectThrowsContaining('REQUEST_TIMEOUT_MS');
+  });
+
+  it('loads configurable database timeout values', async () => {
+    process.env.SQLITE_BUSY_TIMEOUT_MS = '2500';
+    process.env.DB_STATEMENT_TIMEOUT_MS = '20000';
+    process.env.DB_QUERY_TIMEOUT_MS = '25000';
+    process.env.DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS = '45000';
+    const cfg = await loadConfig();
+    expect(cfg.sqliteBusyTimeoutMs).toBe(2500);
+    expect(cfg.databaseStatementTimeoutMs).toBe(20000);
+    expect(cfg.databaseQueryTimeoutMs).toBe(25000);
+    expect(cfg.databaseIdleTransactionTimeoutMs).toBe(45000);
+  });
+
+  it('rejects invalid database timeout values', async () => {
+    process.env.DB_STATEMENT_TIMEOUT_MS = '0';
+    await expectThrowsContaining('DB_STATEMENT_TIMEOUT_MS');
   });
 
   // ── LOG_SAMPLE_RATE ──────────────────────────────────────────────────────────

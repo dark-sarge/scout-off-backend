@@ -120,7 +120,7 @@ describe('config validation: ADMIN_WALLET', () => {
       nodeEnv: 'staging',
       adminWallet: undefined,
       platformSecretKey: 'SKEY1',
-      jwtSecret: 'jwt-secret',
+      jwtSecret: 'a'.repeat(64),
     });
 
     expect(result.success).toBe(true);
@@ -133,7 +133,7 @@ describe('config validation: ADMIN_WALLET', () => {
       nodeEnv: 'development',
       adminWallet: undefined,
       platformSecretKey: 'SKEY1',
-      jwtSecret: 'jwt-secret',
+      jwtSecret: 'a'.repeat(64),
     });
 
     expect(result.success).toBe(true);
@@ -158,7 +158,7 @@ describe('config validation: ADMIN_WALLET', () => {
       platformSecretKey: 'SKEY1',
       sep10ServerSecret: 'SKEY2',
       apiKeyLookupSecret: validSecret,
-      jwtSecret: 'jwt-secret',
+      jwtSecret: 'a'.repeat(64),
     });
 
     expect(result.success).toBe(true);
@@ -195,7 +195,7 @@ describe('config validation: SEP10_SERVER_SECRET', () => {
       adminWallet: VALID_WALLET,
       sep10ServerSecret: undefined,
       platformSecretKey: 'SKEY1',
-      jwtSecret: 'jwt-secret',
+      jwtSecret: 'a'.repeat(64),
     });
 
     expect(result.success).toBe(true);
@@ -208,7 +208,7 @@ describe('config validation: SEP10_SERVER_SECRET', () => {
       nodeEnv: 'development',
       sep10ServerSecret: undefined,
       platformSecretKey: 'SKEY1',
-      jwtSecret: 'jwt-secret',
+      jwtSecret: 'a'.repeat(64),
     });
 
     expect(result.success).toBe(true);
@@ -233,7 +233,7 @@ describe('config validation: SEP10_SERVER_SECRET', () => {
       sep10ServerSecret: VALID_SECRET,
       platformSecretKey: 'SKEY1',
       apiKeyLookupSecret: validSecret,
-      jwtSecret: 'jwt-secret',
+      jwtSecret: 'a'.repeat(64),
     });
 
     expect(result.success).toBe(true);
@@ -271,7 +271,7 @@ describe('config validation: API_KEY_LOOKUP_SECRET', () => {
       adminWallet: VALID_WALLET,
       apiKeyLookupSecret: undefined,
       platformSecretKey: 'SKEY1',
-      jwtSecret: 'jwt-secret',
+      jwtSecret: 'a'.repeat(64),
     });
 
     expect(result.success).toBe(true);
@@ -284,7 +284,7 @@ describe('config validation: API_KEY_LOOKUP_SECRET', () => {
       nodeEnv: 'development',
       apiKeyLookupSecret: undefined,
       platformSecretKey: 'SKEY1',
-      jwtSecret: 'jwt-secret',
+      jwtSecret: 'a'.repeat(64),
     });
 
     expect(result.success).toBe(true);
@@ -309,7 +309,7 @@ describe('config validation: API_KEY_LOOKUP_SECRET', () => {
       sep10ServerSecret: VALID_SECRET,
       apiKeyLookupSecret: validSecret,
       platformSecretKey: 'SKEY1',
-      jwtSecret: 'jwt-secret',
+      jwtSecret: 'a'.repeat(64),
     });
 
     expect(result.success).toBe(true);
@@ -331,7 +331,7 @@ describe('config validation: PLATFORM_SECRET_KEY', () => {
       sep10ServerSecret: VALID_SECRET,
       apiKeyLookupSecret: validSecret,
       platformSecretKey: undefined,
-      jwtSecret: 'jwt-secret',
+      jwtSecret: 'a'.repeat(64),
     });
 
     expect(result.success).toBe(false);
@@ -343,7 +343,7 @@ describe('config validation: PLATFORM_SECRET_KEY', () => {
       nodeEnv: 'staging',
       adminWallet: VALID_WALLET,
       platformSecretKey: undefined,
-      jwtSecret: 'jwt-secret',
+      jwtSecret: 'a'.repeat(64),
     });
 
     expect(result.success).toBe(false);
@@ -354,7 +354,7 @@ describe('config validation: PLATFORM_SECRET_KEY', () => {
     const result = await loadConfigWithEnv({
       nodeEnv: 'development',
       platformSecretKey: undefined,
-      jwtSecret: 'jwt-secret',
+      jwtSecret: 'a'.repeat(64),
     });
 
     expect(result.success).toBe(false);
@@ -365,7 +365,7 @@ describe('config validation: PLATFORM_SECRET_KEY', () => {
     const result = await loadConfigWithEnv({
       nodeEnv: 'test',
       platformSecretKey: undefined,
-      jwtSecret: 'jwt-secret',
+      jwtSecret: 'a'.repeat(64),
     });
 
     expect(result.success).toBe(true);
@@ -379,7 +379,7 @@ describe('config validation: PLATFORM_SECRET_KEY', () => {
       sep10ServerSecret: VALID_SECRET,
       apiKeyLookupSecret: validSecret,
       platformSecretKey: 'SKEY1',
-      jwtSecret: 'jwt-secret',
+      jwtSecret: 'a'.repeat(64),
     });
 
     expect(result.success).toBe(true);
@@ -448,10 +448,10 @@ describe('config validation: JWT_SECRET', () => {
       sep10ServerSecret: VALID_SECRET,
       apiKeyLookupSecret: validSecret,
       platformSecretKey: 'SKEY1',
-      jwtSecret: 'my-jwt-secret',
+      jwtSecret: 'a'.repeat(64),
     });
 
     expect(result.success).toBe(true);
-    expect(result.config.jwtSecret).toBe('my-jwt-secret');
+    expect(result.config.jwtSecret).toBe('a'.repeat(64));
   });
 });

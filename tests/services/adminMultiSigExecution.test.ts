@@ -9,7 +9,6 @@
  * 5. Execution failures are handled gracefully with retry capability
  */
 
-import { jest } from '@jest/globals';
 import request from 'supertest';
 import { Keypair, Transaction, Networks } from '@stellar/stellar-sdk';
 import app from '../../src/app';

@@ -22,6 +22,9 @@ const REQUIRED_RUNTIME_VARS = ['CONTRACT_ID', 'JWT_SECRET'];
 // Valid NODE_ENV values; defaults to 'development' when unset.
 const VALID_NODE_ENVS = ['development', 'test', 'production'];
 
+// Valid NETWORK values; defaults to 'testnet' when unset.
+const VALID_NETWORKS = ['testnet', 'mainnet', 'futurenet', 'standalone'];
+
 // Valid DB_DRIVER values; defaults to 'sqlite' when unset.
 const VALID_DB_DRIVERS = ['sqlite', 'postgres'];
 
@@ -32,6 +35,12 @@ function validateRuntimeEnv(env = process.env) {
   const nodeEnv = env.NODE_ENV ?? 'development';
   if (!VALID_NODE_ENVS.includes(nodeEnv)) {
     errors.push(`NODE_ENV="${nodeEnv}" is invalid. Must be one of: ${VALID_NODE_ENVS.join(', ')}`);
+  }
+
+  // Validate NETWORK
+  const network = env.NETWORK ?? 'testnet';
+  if (!VALID_NETWORKS.includes(network)) {
+    errors.push(`NETWORK="${network}" is invalid. Must be one of: ${VALID_NETWORKS.join(', ')}`);
   }
 
   // Validate required vars

@@ -87,7 +87,10 @@ function redactObject(obj: Record<string, unknown>): Record<string, unknown> {
     
     // Handle strings - check for wallet addresses and correlation IDs
     if (typeof value === 'string') {
-      result[key] = redactString(value);
+      const isCorrelationIdKey = lowerKey === 'correlationid' || lowerKey === 'cid';
+      result[key] = isCorrelationIdKey && config.logRedaction.hashCorrelationIds
+        ? hashCorrelationId(value)
+        : redactString(value);
       continue;
     }
     

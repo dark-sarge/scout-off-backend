@@ -15,8 +15,8 @@
 /// Each proptest! block runs 10 000 cases.
 #[cfg(test)]
 mod player_token_invariants {
-    use proptest::prelude::*;
     use player_token::{PlayerTokenContract, PlayerTokenContractClient};
+    use proptest::prelude::*;
     use soroban_sdk::{testutils::Address as _, Address, Env};
 
     // ── helpers ───────────────────────────────────────────────────────────────

@@ -15,11 +15,7 @@ mod multi_contract_progress_update {
     use connection::{ConnectionContract, ConnectionContractClient};
     use progress::{ProgressContract, ProgressContractClient};
     use register::{RegisterContract, RegisterContractClient};
-    use soroban_sdk::{
-        testutils::Address as _,
-        token::StellarAssetClient,
-        Address, Env, String,
-    };
+    use soroban_sdk::{testutils::Address as _, token::StellarAssetClient, Address, Env, String};
     use subscription::{SubscriptionContract, SubscriptionContractClient};
 
     // ── helpers ──────────────────────────────────────────────────────────────
@@ -47,14 +43,14 @@ mod multi_contract_progress_update {
             .address();
         StellarAssetClient::new(env, &token_addr).mint(&admin, &1_000_000_000_000_000i128);
 
-        let reg_id   = env.register_contract(None, RegisterContract);
-        let prog_id  = env.register_contract(None, ProgressContract);
-        let sub_id   = env.register_contract(None, SubscriptionContract);
-        let conn_id  = env.register_contract(None, ConnectionContract);
+        let reg_id = env.register_contract(None, RegisterContract);
+        let prog_id = env.register_contract(None, ProgressContract);
+        let sub_id = env.register_contract(None, SubscriptionContract);
+        let conn_id = env.register_contract(None, ConnectionContract);
 
-        let reg  = RegisterContractClient::new(env, &reg_id);
+        let reg = RegisterContractClient::new(env, &reg_id);
         let prog = ProgressContractClient::new(env, &prog_id);
-        let sub  = SubscriptionContractClient::new(env, &sub_id);
+        let sub = SubscriptionContractClient::new(env, &sub_id);
         let conn = ConnectionContractClient::new(env, &conn_id);
 
         reg.initialize(&admin, &token_addr, &100u32);

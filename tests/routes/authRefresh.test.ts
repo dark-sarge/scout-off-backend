@@ -114,6 +114,7 @@ describe('POST /auth/refresh', () => {
       .send({ refreshToken: 'not-a-jwt' });
     expect(res.status).toBe(401);
     expect(res.body.success).toBe(false);
+    expect(res.body.code).toBe('TOKEN_INVALID');
   });
 
   it('returns 401 when a plain access token (no type:refresh) is submitted', async () => {
@@ -123,6 +124,7 @@ describe('POST /auth/refresh', () => {
       .send({ refreshToken: accessToken });
     expect(res.status).toBe(401);
     expect(res.body.error).toMatch(/not a refresh token/i);
+    expect(res.body.code).toBe('TOKEN_INVALID');
   });
 
   it('returns 401 for an expired refresh token', async () => {
@@ -135,6 +137,16 @@ describe('POST /auth/refresh', () => {
       .post('/auth/refresh')
       .send({ refreshToken: expired });
     expect(res.status).toBe(401);
+    expect(res.body.code).toBe('TOKEN_EXPIRED');
+  });
+
+  it('returns TOKEN_INVALID for a refresh token missing required claims', async () => {
+    const malformed = jwt.sign({ type: 'refresh' }, SECRET, { expiresIn: 3600 });
+    const res = await request(app)
+      .post('/auth/refresh')
+      .send({ refreshToken: malformed });
+    expect(res.status).toBe(401);
+    expect(res.body.code).toBe('TOKEN_INVALID');
   });
 
   it('returns a new token pair for a valid refresh token', async () => {
@@ -151,6 +163,17 @@ describe('POST /auth/refresh', () => {
 
     // New tokens must be different from the submitted one
     expect(res.body.refreshToken).not.toBe(refreshToken);
+  });
+
+  it('sets Cache-Control: no-store and Pragma: no-cache on /auth/refresh responses', async () => {
+    const refreshToken = makeRefreshToken('GACCOUNT123', 'scout');
+    const res = await request(app)
+      .post('/auth/refresh')
+      .send({ refreshToken });
+
+    expect(res.status).toBe(200);
+    expect(res.headers['cache-control']).toBe('no-store');
+    expect(res.headers['pragma']).toBe('no-cache');
   });
 
   it('new access token carries the correct role', async () => {
@@ -191,6 +214,7 @@ describe('POST /auth/refresh', () => {
       .send({ refreshToken });
     expect(second.status).toBe(401);
     expect(second.body.error).toMatch(/revoked/i);
+    expect(second.body.code).toBe('TOKEN_INVALID');
   });
 });
 

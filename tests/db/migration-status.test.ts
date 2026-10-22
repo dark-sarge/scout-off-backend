@@ -41,6 +41,14 @@ describe('discoverMigrationFiles', () => {
     expect(result).not.toContain('config.json');
   });
 
+  it('excludes down-migration files from the forward migration list', () => {
+    fs.writeFileSync(path.join(tempDir, '001_initial.sql'), '');
+    fs.writeFileSync(path.join(tempDir, '001_initial.down.sql'), '');
+    fs.writeFileSync(path.join(tempDir, 'README.md'), '');
+
+    expect(discoverMigrationFiles(tempDir)).toEqual(['001_initial.sql']);
+  });
+
   it('returns files sorted alphabetically', () => {
     // Create files in non-alphabetical order
     fs.writeFileSync(path.join(tempDir, '003_tables.sql'), '');

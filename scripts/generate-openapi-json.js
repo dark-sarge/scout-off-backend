@@ -226,6 +226,34 @@ function buildOperation(route, openApiPath) {
   return op;
 }
 
+function disambiguateOperationIds(paths) {
+  const operationIdEntries = new Map();
+  for (const [openApiPath, pathItem] of Object.entries(paths)) {
+    for (const [method, operation] of Object.entries(pathItem)) {
+      if (!operation.operationId) continue;
+      const entries = operationIdEntries.get(operation.operationId) || [];
+      entries.push({ openApiPath, method, operation });
+      operationIdEntries.set(operation.operationId, entries);
+    }
+  }
+
+  for (const [operationId, entries] of operationIdEntries) {
+    if (entries.length < 2) continue;
+    for (const { openApiPath, method, operation } of entries) {
+      const suffix = openApiPath
+        .split('/')
+        .filter(Boolean)
+        .map((segment) => {
+          const name = segment.replace(/[{}]/g, '');
+          const capitalized = name.replace(/(^|[^A-Za-z0-9])([A-Za-z0-9])/g, (_, __, char) => char.toUpperCase());
+          return segment.startsWith('{') ? `By${capitalized}` : capitalized;
+        })
+        .join('');
+      operation.operationId = `${operationId}At${suffix}${method[0].toUpperCase()}${method.slice(1)}`;
+    }
+  }
+}
+
 function generateSpec() {
   const raw = fs.readFileSync(COMPONENTS_PATH, 'utf8');
   const spec = yaml.load(raw);
@@ -254,6 +282,11 @@ function generateSpec() {
       spec.paths[openApiPath][route.method.toLowerCase()] = buildOperation(route, openApiPath);
     }
   }
+
+  // OpenAPI operationId values must be unique for code generators to produce
+  // stable operation types. Shared controller names can occur on different
+  // routes, so add a deterministic route/method suffix only for duplicates.
+  disambiguateOperationIds(spec.paths);
 
   // Stable key order: sort paths, and within each path sort HTTP methods in
   // a conventional order, so regenerating with no source changes produces a

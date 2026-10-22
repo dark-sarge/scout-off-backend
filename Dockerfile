@@ -1,35 +1,63 @@
 # ─── Stage 1: Build ──────────────────────────────────────────────────────────
-FROM node:22-alpine AS builder
+# Pin the multi-architecture Node image index digest so both stages build from
+# the same immutable base. Update this digest deliberately to pick up patches.
+FROM node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402 AS builder
 
 # Accept the Git commit SHA at build time (defaults to "unknown")
 ARG GIT_COMMIT=unknown
 
 WORKDIR /app
 
+# Install build dependencies for native modules (better-sqlite3 uses node-gyp).
+# These are needed in the builder stage to compile better-sqlite3 for Alpine (musl).
+RUN apk add --no-cache python3 make g++
+
 # Install dependencies first (better layer caching).
-# --ignore-scripts: the `prepare` script installs git hooks via husky, which
-# is meaningless (and, once dev deps are pruned below, unavailable) inside a
-# container that never has a .git directory.
+# Disable husky install via HUSKY=0 environment variable (husky v9 respects this).
+# This allows scripts to run for better-sqlite3's prebuild-install/node-gyp,
+# while skipping the husky prepare hook.
 COPY package*.json ./
-RUN npm ci --ignore-scripts
+RUN HUSKY=0 npm ci
 
 # Copy source and compile TypeScript → dist/
 COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build
 
-# Prune dev dependencies so only production deps are copied to runtime stage
-RUN npm ci --omit=dev --ignore-scripts
+# Prune dev dependencies so only production deps are copied to runtime stage.
+# `npm prune` rather than a second `npm ci --omit=dev`: a fresh install re-runs
+# the root `prepare` script (`husky`), which fails with "husky: not found"
+# because husky is a dev dependency. Pruning runs no lifecycle scripts and
+# keeps the better-sqlite3 binary already compiled above.
+RUN npm prune --omit=dev
 
 # ─── Stage 2: Runtime ────────────────────────────────────────────────────────
-FROM node:22-alpine AS runtime
+FROM node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402 AS runtime
 
-# Re-declare ARG so the value is available in this stage, then bake it into
-# the image as an ENV so the running container can read it via process.env.
+# Build arguments for OCI annotations and runtime environment
 ARG GIT_COMMIT=unknown
+ARG VERSION=1.0.0
+ARG BUILD_DATE=""
+ARG SOURCE=https://github.com/scout-off/scout-off-backend
+ARG TITLE="scout-off-backend"
+ARG DESCRIPTION="Backend API for ScoutOff — decentralized football scouting platform on Stellar"
+ARG LICENSES="Apache-2.0"
 
-# Non-root user for least-privilege runtime
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+# OCI Image Spec annotations (https://github.com/opencontainers/image-spec/blob/main/annotations.md)
+LABEL org.opencontainers.image.title="${TITLE}" \
+      org.opencontainers.image.description="${DESCRIPTION}" \
+      org.opencontainers.image.source="${SOURCE}" \
+      org.opencontainers.image.revision="${GIT_COMMIT}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.licenses="${LICENSES}"
+
+# Non-root user for least-privilege runtime. The app runs as `node dist/index.js`
+# and never needs npm at runtime, so drop the npm/npx bundled with the base
+# image: it is unused attack surface and the source of every HIGH finding in
+# the CI Trivy scan (vulnerable copies of brace-expansion, picomatch, etc.).
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup \
+  && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 
 WORKDIR /app
 

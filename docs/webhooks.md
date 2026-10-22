@@ -35,6 +35,7 @@ to every subscriber's URL, with headers:
 
 ```
 Content-Type: application/json
+X-Webhook-Timestamp: <Unix timestamp in seconds>
 X-Webhook-Signature: sha256=<hex-encoded HMAC-SHA256 digest>
 ```
 
@@ -51,8 +52,11 @@ code that ignores unknown keys. Subscribers that validate the payload shape
 (e.g. strict JSON Schema validation) must update their schema to accept the
 new field.
 
-Delivery uses exponential backoff (3 attempts by default: 500ms, then 1000ms
-between attempts) via `postWebhookWithRetry` in `src/services/webhooks.ts`.
+Delivery uses full-jitter exponential backoff (3 attempts by default, with
+backoff caps of 500ms and 1000ms) via `postWebhookWithRetry` in
+`src/services/webhooks.ts`. `429` and `503` responses honor a valid
+`Retry-After` header (delta-seconds or HTTP date), and response bodies are
+drained before retrying.
 Each individual attempt is bounded by `WEBHOOK_TIMEOUT_MS` (default: 10s) — a
 subscriber that accepts the connection but never responds is aborted and the
 attempt treated as a failure, rather than hanging indefinitely (#691).
@@ -265,17 +269,28 @@ Fires when an admin withdraws accumulated platform fees from the contract.
 
 ## Verifying the signature
 
+`X-Webhook-Timestamp` is the request creation time as Unix seconds.
 `X-Webhook-Signature` is computed as:
 
 ```
-sha256=HMAC_SHA256(secret, raw_request_body_bytes)
+sha256=HMAC_SHA256(secret, timestamp + "." + raw_request_body_bytes)
 ```
 
-The HMAC is computed over the **raw bytes of the request body exactly as
-sent** — do not re-serialize the parsed JSON before verifying, since
-key ordering/whitespace differences would produce a different digest than
-what was signed. The `deliveryId` field is part of the signed body, so
-a receiver can rely on it being authentic.
+The HMAC is computed over the timestamp header followed by a period and the
+**raw bytes of the request body exactly as sent** — do not re-serialize the
+parsed JSON before verifying, since key ordering/whitespace differences would
+produce a different digest than what was signed. The timestamp is covered by
+the HMAC, so it cannot be changed independently. The `deliveryId` field is
+also part of the signed body.
+
+Receivers **must** reject requests whose timestamp is outside a short
+freshness window (five minutes is recommended), in addition to checking the
+HMAC with a constant-time comparison. This prevents an old captured delivery
+from being accepted indefinitely. The delivery ID is stable across retries and
+dead-letter replays, so receivers **must also** durably deduplicate by
+`deliveryId` before applying side effects; an in-memory cache alone is not
+sufficient for production or multi-instance receivers. Keep deduplication
+records for as long as the sender may replay a delivery.
 
 This mirrors the pattern used by Stripe and GitHub webhooks: recompute the
 HMAC yourself with your subscription's secret, and compare it to the value in
@@ -287,10 +302,18 @@ information about how many bytes matched.
 ```js
 const crypto = require('crypto');
 
-function isValidSignature(rawBody, signatureHeader, secret) {
+function isValidSignature(rawBody, timestamp, signatureHeader, secret) {
+  if (!timestamp || !/^\d+$/.test(timestamp)) return false;
+  const timestampSeconds = Number(timestamp);
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  if (!Number.isSafeInteger(timestampSeconds) || Math.abs(nowSeconds - timestampSeconds) > 300) {
+    return false;
+  }
   if (!signatureHeader || !signatureHeader.startsWith('sha256=')) return false;
 
-  const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+  const expected = crypto.createHmac('sha256', secret)
+    .update(`${timestamp}.${rawBody}`)
+    .digest('hex');
   const provided = signatureHeader.slice('sha256='.length);
 
   const expectedBuf = Buffer.from(expected, 'hex');
@@ -305,11 +328,13 @@ function isValidSignature(rawBody, signatureHeader, secret) {
 
 app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
   const signature = req.headers['x-webhook-signature'];
-  if (!isValidSignature(req.body, signature, process.env.SCOUTOFF_WEBHOOK_SECRET)) {
+  const timestamp = req.headers['x-webhook-timestamp'];
+  if (!isValidSignature(req.body, timestamp, signature, process.env.SCOUTOFF_WEBHOOK_SECRET)) {
     return res.status(401).send('invalid signature');
   }
 
   const event = JSON.parse(req.body);
+  // Persistently deduplicate event.deliveryId before applying side effects.
   // ... handle event ...
   res.status(200).end();
 });

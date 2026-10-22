@@ -1,11 +1,13 @@
 #![no_std]
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, vec, Address, Env, IntoVal, String, Symbol, Vec,
-};
 use scout_off_shared::{
     errors::Error,
-    storage::{bump_instance, is_initialized, is_paused, MAX_PAGE_SIZE, Page, set_initialized, set_paused},
+    storage::{
+        bump_instance, is_initialized, is_paused, set_initialized, set_paused, MAX_PAGE_SIZE,
+    },
+};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, vec, Address, Env, IntoVal, String, Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -44,6 +46,26 @@ pub struct TrialOfferRecord {
     pub player_id: u64,
     pub details_uri: String,
     pub created_at: u64,
+}
+
+/// A page of `ConnectionRecord` results; `next` is the start index of the following
+/// page, or `None` when this is the last one. `#[contracttype]` does not
+/// support generics, so each contract defines its own concrete page type.
+#[contracttype]
+#[derive(Clone)]
+pub struct ConnectionPage {
+    pub items: Vec<ConnectionRecord>,
+    pub next: Option<u32>,
+}
+
+/// A page of `TrialOfferRecord` results; `next` is the start index of the following
+/// page, or `None` when this is the last one. `#[contracttype]` does not
+/// support generics, so each contract defines its own concrete page type.
+#[contracttype]
+#[derive(Clone)]
+pub struct TrialOfferPage {
+    pub items: Vec<TrialOfferRecord>,
+    pub next: Option<u32>,
 }
 
 #[contracttype]
@@ -244,7 +266,11 @@ impl ConnectionContract {
         }
 
         env.events().publish(
-            (Symbol::new(&env, "contact_unlocked"), scout.clone(), player_id),
+            (
+                Symbol::new(&env, "contact_unlocked"),
+                scout.clone(),
+                player_id,
+            ),
             (connection_type,),
         );
 
@@ -253,7 +279,11 @@ impl ConnectionContract {
     }
 
     /// Return the ConnectionRecord for (scout, player_id), or PlayerNotFound if none.
-    pub fn get_connection(env: Env, scout: Address, player_id: u64) -> Result<ConnectionRecord, Error> {
+    pub fn get_connection(
+        env: Env,
+        scout: Address,
+        player_id: u64,
+    ) -> Result<ConnectionRecord, Error> {
         env.storage()
             .instance()
             .get(&DataKey::Connection(scout, player_id))
@@ -327,7 +357,11 @@ impl ConnectionContract {
         env.storage().instance().set(&conn_key_final, &updated);
 
         env.events().publish(
-            (Symbol::new(&env, "connection_closed"), caller.clone(), player_id),
+            (
+                Symbol::new(&env, "connection_closed"),
+                caller.clone(),
+                player_id,
+            ),
             (),
         );
 
@@ -406,7 +440,9 @@ impl ConnectionContract {
             .get(&player_key)
             .unwrap_or_else(|| Vec::new(&env));
         player_connections.push_back(scout.clone());
-        env.storage().instance().set(&player_key, &player_connections);
+        env.storage()
+            .instance()
+            .set(&player_key, &player_connections);
 
         let reg_addr: Address = env
             .storage()
@@ -420,7 +456,11 @@ impl ConnectionContract {
         );
 
         env.events().publish(
-            (Symbol::new(&env, "trial_offer_logged"), scout.clone(), player_id),
+            (
+                Symbol::new(&env, "trial_offer_logged"),
+                scout.clone(),
+                player_id,
+            ),
             (details_uri,),
         );
 
@@ -487,21 +527,21 @@ impl ConnectionContract {
     }
 
     /// Return a page of connection records for a scout.
-    /// 
+    ///
     /// This is the paginated variant of [`list_connections`]. It returns at most `limit` connections
-    /// starting from the given `start` index. Use `next` in the returned [`Page`] to fetch
+    /// starting from the given `start` index. Use `next` in the returned [`ConnectionPage`] to fetch
     /// subsequent pages until it is `None`.
-    /// 
+    ///
     /// # Arguments
     /// * `scout` - The scout address whose connections to list
     /// * `start` - Zero-based index of the first connection to return
     /// * `limit` - Maximum number of connections to return (capped at MAX_PAGE_SIZE = 50)
-    /// 
+    ///
     /// # Returns
-    /// A [`Page<ConnectionRecord>`] containing:
+    /// A [`ConnectionPage`] containing:
     /// * `items`: The slice of connections for this page
     /// * `next`: The start index for the next page, or `None` if no more results
-    /// 
+    ///
     /// # Errors
     /// * [`Error::InvalidInput`] — `start` or `limit` is invalid
     pub fn list_connections_page(
@@ -509,30 +549,33 @@ impl ConnectionContract {
         scout: Address,
         start: u32,
         limit: u32,
-    ) -> Result<Page<ConnectionRecord>, Error> {
+    ) -> Result<ConnectionPage, Error> {
         // Validate inputs
         if limit == 0 {
             return Err(Error::InvalidInput);
         }
         let max_limit = MAX_PAGE_SIZE;
         let effective_limit = limit.min(max_limit);
-        
+
         let player_ids: Vec<u64> = env
             .storage()
             .instance()
             .get(&DataKey::ScoutConnections(scout.clone()))
             .unwrap_or_else(|| Vec::new(&env));
 
-        let total = player_ids.len() as u32;
+        let total = player_ids.len();
         if start >= total {
-            return Ok(Page { items: Vec::new(&env), next: None });
+            return Ok(ConnectionPage {
+                items: Vec::new(&env),
+                next: None,
+            });
         }
 
         let end = (start + effective_limit).min(total);
-        
+
         let mut results = Vec::new(&env);
         for i in start..end {
-            let pid = player_ids.get_unchecked(i as usize);
+            let pid = player_ids.get_unchecked(i);
             if let Some(record) = env
                 .storage()
                 .instance()
@@ -541,28 +584,31 @@ impl ConnectionContract {
                 results.push_back(record);
             }
         }
-        
+
         let next = if end < total { Some(end) } else { None };
-        
-        Ok(Page { items: results, next })
+
+        Ok(ConnectionPage {
+            items: results,
+            next,
+        })
     }
 
     /// Return a page of trial offer records for a given player.
-    /// 
+    ///
     /// This is the paginated variant of [`get_connections`]. It returns at most `limit` records
-    /// starting from the given `start` index. Use `next` in the returned [`Page`] to fetch
+    /// starting from the given `start` index. Use `next` in the returned [`ConnectionPage`] to fetch
     /// subsequent pages until it is `None`.
-    /// 
+    ///
     /// # Arguments
     /// * `player_id` - The player ID whose trial offers to list
     /// * `start` - Zero-based index of the first record to return
     /// * `limit` - Maximum number of records to return (capped at MAX_PAGE_SIZE = 50)
-    /// 
+    ///
     /// # Returns
-    /// A [`Page<TrialOfferRecord>`] containing:
+    /// A [`TrialOfferPage`] containing:
     /// * `items`: The slice of trial offers for this page
     /// * `next`: The start index for the next page, or `None` if no more results
-    /// 
+    ///
     /// # Errors
     /// * [`Error::InvalidInput`] — `start` or `limit` is invalid
     pub fn get_connections_page(
@@ -570,30 +616,33 @@ impl ConnectionContract {
         player_id: u64,
         start: u32,
         limit: u32,
-    ) -> Result<Page<TrialOfferRecord>, Error> {
+    ) -> Result<TrialOfferPage, Error> {
         // Validate inputs
         if limit == 0 {
             return Err(Error::InvalidInput);
         }
         let max_limit = MAX_PAGE_SIZE;
         let effective_limit = limit.min(max_limit);
-        
+
         let scouts: Vec<Address> = env
             .storage()
             .instance()
             .get(&DataKey::PlayerConnections(player_id))
             .unwrap_or_else(|| Vec::new(&env));
 
-        let total = scouts.len() as u32;
+        let total = scouts.len();
         if start >= total {
-            return Ok(Page { items: Vec::new(&env), next: None });
+            return Ok(TrialOfferPage {
+                items: Vec::new(&env),
+                next: None,
+            });
         }
 
         let end = (start + effective_limit).min(total);
-        
+
         let mut results = Vec::new(&env);
         for i in start..end {
-            let scout = scouts.get_unchecked(i as usize);
+            let scout = scouts.get_unchecked(i);
             let offer_key = DataKey::TrialOfferKey(scout.clone(), player_id);
             if let Some(data) = env
                 .storage()
@@ -608,28 +657,31 @@ impl ConnectionContract {
                 });
             }
         }
-        
+
         let next = if end < total { Some(end) } else { None };
-        
-        Ok(Page { items: results, next })
+
+        Ok(TrialOfferPage {
+            items: results,
+            next,
+        })
     }
 
     /// Return a page of trial offers made by a given scout.
-    /// 
+    ///
     /// This is the paginated variant of [`get_trial_offers`]. It returns at most `limit` records
-    /// starting from the given `start` index. Use `next` in the returned [`Page`] to fetch
+    /// starting from the given `start` index. Use `next` in the returned [`TrialOfferPage`] to fetch
     /// subsequent pages until it is `None`.
-    /// 
+    ///
     /// # Arguments
     /// * `scout` - The scout address whose trial offers to list
     /// * `start` - Zero-based index of the first record to return
     /// * `limit` - Maximum number of records to return (capped at MAX_PAGE_SIZE = 50)
-    /// 
+    ///
     /// # Returns
-    /// A [`Page<TrialOfferRecord>`] containing:
+    /// A [`TrialOfferPage`] containing:
     /// * `items`: The slice of trial offers for this page
     /// * `next`: The start index for the next page, or `None` if no more results
-    /// 
+    ///
     /// # Errors
     /// * [`Error::InvalidInput`] — `start` or `limit` is invalid
     pub fn get_trial_offers_page(
@@ -637,30 +689,33 @@ impl ConnectionContract {
         scout: Address,
         start: u32,
         limit: u32,
-    ) -> Result<Page<TrialOfferRecord>, Error> {
+    ) -> Result<TrialOfferPage, Error> {
         // Validate inputs
         if limit == 0 {
             return Err(Error::InvalidInput);
         }
         let max_limit = MAX_PAGE_SIZE;
         let effective_limit = limit.min(max_limit);
-        
+
         let player_ids: Vec<u64> = env
             .storage()
             .instance()
             .get(&DataKey::ScoutOffers(scout.clone()))
             .unwrap_or_else(|| Vec::new(&env));
 
-        let total = player_ids.len() as u32;
+        let total = player_ids.len();
         if start >= total {
-            return Ok(Page { items: Vec::new(&env), next: None });
+            return Ok(TrialOfferPage {
+                items: Vec::new(&env),
+                next: None,
+            });
         }
 
         let end = (start + effective_limit).min(total);
-        
+
         let mut results = Vec::new(&env);
         for i in start..end {
-            let player_id = player_ids.get_unchecked(i as usize);
+            let player_id = player_ids.get_unchecked(i);
             let offer_key = DataKey::TrialOfferKey(scout.clone(), player_id);
             if let Some(data) = env
                 .storage()
@@ -675,10 +730,13 @@ impl ConnectionContract {
                 });
             }
         }
-        
+
         let next = if end < total { Some(end) } else { None };
-        
-        Ok(Page { items: results, next })
+
+        Ok(TrialOfferPage {
+            items: results,
+            next,
+        })
     }
 }
 
@@ -689,12 +747,8 @@ impl ConnectionContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{
-        testutils::Address as _,
-        token::StellarAssetClient,
-        Env,
-    };
     use register::{RegisterContract, RegisterContractClient};
+    use soroban_sdk::{testutils::Address as _, token::StellarAssetClient, Env};
     use subscription::{SubscriptionContract, SubscriptionContractClient};
 
     fn setup(
@@ -703,8 +757,8 @@ mod tests {
         ConnectionContractClient<'_>,
         RegisterContractClient<'_>,
         SubscriptionContractClient<'_>,
-        Address,  // admin
-        Address,  // token address (SAC)
+        Address, // admin
+        Address, // token address (SAC)
     ) {
         env.mock_all_auths();
 
@@ -761,9 +815,8 @@ mod tests {
         let scout = Address::generate(&env);
         fund(&env, &token, &scout);
         sub.subscribe(&scout, &1u32, &1000u32);
-        let result = conn.try_create_connection(
-            &scout, &player_id, &String::from_str(&env, "direct"),
-        );
+        let result =
+            conn.try_create_connection(&scout, &player_id, &String::from_str(&env, "direct"));
         assert!(result.is_ok());
         drop(admin);
     }
@@ -774,9 +827,8 @@ mod tests {
         let (conn, reg, _sub, _admin, _token) = setup(&env);
         let (_, player_id) = register_player(&env, &reg);
         let scout = Address::generate(&env);
-        let result = conn.try_create_connection(
-            &scout, &player_id, &String::from_str(&env, "direct"),
-        );
+        let result =
+            conn.try_create_connection(&scout, &player_id, &String::from_str(&env, "direct"));
         assert!(result.is_err());
     }
 
@@ -788,9 +840,8 @@ mod tests {
         let scout = Address::generate(&env);
         fund(&env, &token, &scout);
         sub.pay_to_contact(&scout, &player_id);
-        let result = conn.try_create_connection(
-            &scout, &player_id, &String::from_str(&env, "trial"),
-        );
+        let result =
+            conn.try_create_connection(&scout, &player_id, &String::from_str(&env, "trial"));
         assert!(result.is_ok());
     }
 
@@ -907,9 +958,8 @@ mod tests {
         let (conn, reg, _sub, _admin, _token) = setup(&env);
         let scout = Address::generate(&env);
         let (_, player_id) = register_player(&env, &reg);
-        let result = conn.try_log_trial_offer(
-            &scout, &player_id, &String::from_str(&env, "ipfs://offer"),
-        );
+        let result =
+            conn.try_log_trial_offer(&scout, &player_id, &String::from_str(&env, "ipfs://offer"));
         assert!(result.is_err());
     }
 
@@ -947,9 +997,8 @@ mod tests {
     fn double_initialize_fails() {
         let env = Env::default();
         let (conn, _reg, _sub, admin, _token) = setup(&env);
-        let result = conn.try_initialize(
-            &admin, &Address::generate(&env), &Address::generate(&env),
-        );
+        let result =
+            conn.try_initialize(&admin, &Address::generate(&env), &Address::generate(&env));
         assert!(result.is_err());
     }
 
@@ -965,9 +1014,8 @@ mod tests {
         sub.subscribe(&scout, &1u32, &1000u32);
         // Pause the connection contract.
         assert!(conn.try_pause(&admin).is_ok());
-        let result = conn.try_create_connection(
-            &scout, &player_id, &String::from_str(&env, "direct"),
-        );
+        let result =
+            conn.try_create_connection(&scout, &player_id, &String::from_str(&env, "direct"));
         assert!(result.is_err());
     }
 
@@ -981,9 +1029,8 @@ mod tests {
         sub.subscribe(&scout, &1u32, &1000u32);
         conn.pause(&admin);
         conn.unpause(&admin);
-        let result = conn.try_create_connection(
-            &scout, &player_id, &String::from_str(&env, "direct"),
-        );
+        let result =
+            conn.try_create_connection(&scout, &player_id, &String::from_str(&env, "direct"));
         assert!(result.is_ok());
     }
 
@@ -1021,27 +1068,40 @@ mod tests {
             let before_len = conn.get_connections(&player_id).len();
             let before_level = reg.get_player(&player_id).progress_level;
             let result = conn.try_log_trial_offer(
-                &scout, &player_id, &String::from_str(&env, "ipfs://offer"),
+                &scout,
+                &player_id,
+                &String::from_str(&env, "ipfs://offer"),
             );
             let after_len = conn.get_connections(&player_id).len();
             let after_level = reg.get_player(&player_id).progress_level;
 
             if result.is_ok() {
                 if has_logged_offer {
-                    assert_eq!(after_len, before_len,
-                        "step {step}: duplicate offer should not duplicate state");
+                    assert_eq!(
+                        after_len, before_len,
+                        "step {step}: duplicate offer should not duplicate state"
+                    );
                 } else {
-                    assert_eq!(after_len, before_len + 1,
-                        "step {step}: first successful offer should add a connection");
+                    assert_eq!(
+                        after_len,
+                        before_len + 1,
+                        "step {step}: first successful offer should add a connection"
+                    );
                     has_logged_offer = true;
                 }
-                assert!(after_level >= before_level,
-                    "step {step}: progress should not decrease");
+                assert!(
+                    after_level >= before_level,
+                    "step {step}: progress should not decrease"
+                );
             } else {
-                assert_eq!(after_len, before_len,
-                    "step {step}: failed offer must not mutate connections");
-                assert_eq!(after_level, before_level,
-                    "step {step}: failed offer must not mutate progress");
+                assert_eq!(
+                    after_len, before_len,
+                    "step {step}: failed offer must not mutate connections"
+                );
+                assert_eq!(
+                    after_level, before_level,
+                    "step {step}: failed offer must not mutate progress"
+                );
             }
 
             state = state

@@ -296,6 +296,17 @@ describe.each(ROUTES)('%s route — POST /api/scouts/:wallet/%s', (_label, segme
   });
 });
 
+describe('deprecated trial-offer alias response headers', () => {
+  it('includes the RFC 9745 Deprecation header on error responses', async () => {
+    const res = await request(app)
+      .post(`/api/scouts/${WALLET}/trial-offer`)
+      .send(VALID_BODY);
+
+    expect(res.status).toBe(401);
+    expect(res.headers.deprecation).toBe('@1787011200');
+  });
+});
+
 // ─── Cross-route equivalence ──────────────────────────────────────────────────
 
 describe('trial-offer submission routes are equivalent', () => {

@@ -188,6 +188,30 @@ describe.each(stores)('auth rate limit — independence and window reset ($name)
     expect(res.status).not.toHaveBeenCalled();
   });
 
+  it('shares identity limits across IPs while keeping identities isolated', async () => {
+    const mw = rateLimit({
+      name: 'auth:token:account',
+      windowMs: 60_000,
+      max: 1,
+      store,
+      keyGenerator: (req) => `account:${(req as Request & { accountKey?: string }).accountKey}`,
+    });
+    const first = makeReqRes('10.1.0.5');
+    (first.req as Request & { accountKey?: string }).accountKey = 'GPLAYER';
+    await mw(first.req, first.res, first.next);
+    expect(first.next).toHaveBeenCalledTimes(1);
+
+    const sameIdentity = makeReqRes('10.1.0.6');
+    (sameIdentity.req as Request & { accountKey?: string }).accountKey = 'GPLAYER';
+    await mw(sameIdentity.req, sameIdentity.res, sameIdentity.next);
+    expect(sameIdentity.res.status).toHaveBeenCalledWith(429);
+
+    const differentIdentity = makeReqRes('10.1.0.5');
+    (differentIdentity.req as Request & { accountKey?: string }).accountKey = 'GOTHER';
+    await mw(differentIdentity.req, differentIdentity.res, differentIdentity.next);
+    expect(differentIdentity.next).toHaveBeenCalledTimes(1);
+  });
+
   it('disables rate limiting when config.rateLimit.enabled is false', async () => {
     // Mutate the live config object to simulate RATE_LIMIT_ENABLED=false
     const configModule = require('../../src/config');

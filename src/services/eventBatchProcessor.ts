@@ -14,10 +14,9 @@
  */
 
 import { server } from './stellar';
-import { scValToNative } from '@stellar/stellar-sdk';
 import config from '../config';
 import { getDb } from '../db';
-import { normalizePayload, normalizeEventId } from './indexer';
+import { normalizeEventId, normalizeSorobanEvent } from './indexer';
 import { normalizeAndSortEvents, type RawIndexerEvent } from './eventOrdering';
 import { logAuditEvent } from './audit';
 import { logger } from '../utils/logger';
@@ -127,10 +126,7 @@ export async function processEventBatches(
           let batchInserted = 0;
           for (const event of events) {
             const raw = event.raw as any;
-            const type = raw.topic?.[0] ? (scValToNative(raw.topic[0]) as string) : '';
-            const payload = normalizePayload(
-              (raw.value ? (scValToNative(raw.value) as Record<string, unknown>) : {}) ?? {},
-            );
+            const { type, payload } = normalizeSorobanEvent(raw);
             const eventId = normalizeEventId(
               event.contractId,
               event.ledger,

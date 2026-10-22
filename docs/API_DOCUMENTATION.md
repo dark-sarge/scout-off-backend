@@ -67,10 +67,20 @@ Tags:
 ```bash
 npm run build:openapi     # regenerate src/openapi.yaml + src/openapi.json from route sources
 npm run validate:openapi  # fail if the committed spec is stale relative to the routes
+npm run build:client      # regenerate the versioned TypeScript client from the OpenAPI spec
+npm run validate:client   # fail if generated client types/version are stale
 npm run docs:check        # fail if any route lacks a summary + at least one @response tag
 ```
 
-All three run in CI (`.github/workflows/ci.yml`) on every push and PR — a route added without documentation, or a spec that wasn't regenerated after a route changed, fails the build.
+All documentation and client checks run in CI (`.github/workflows/ci.yml`) on every push and PR — a route added without documentation, a stale spec, or stale generated client types fails the build.
+
+## TypeScript client
+
+The checked-in package at `clients/typescript` provides a typed Fetch client
+generated from `src/openapi.yaml`. Its package version is synchronized with
+`info.version`; bump the API version in `src/openapi.components.yaml` when
+publishing a client with a breaking API change. See
+[the client README](../clients/typescript/README.md) for installation and usage.
 
 ## Adding a new resource router
 

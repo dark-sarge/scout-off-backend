@@ -28,6 +28,11 @@
 
 set -euo pipefail
 
+# Note: match against "${RENDERED}" with a here-string, never
+# `echo "${RENDERED}" | grep -q`. Under pipefail, grep -q exiting on the first
+# match can SIGPIPE the echo and fail the pipeline, flakily reporting a
+# present variable as missing.
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CHART_DIR="${REPO_ROOT}/helm/scout-off-backend"
@@ -104,7 +109,7 @@ FAILURES=0
 check_env() {
   local var="$1"
   local category="$2"   # "secret" or "configmap"
-  if echo "${RENDERED}" | grep -q "name: ${var}"; then
+  if grep -q "name: ${var}" <<< "${RENDERED}"; then
     pass "${var} is wired (${category})"
   else
     echo "[validate-helm-env-wiring] FAIL: ${var} is NOT wired in the rendered deployment (expected: ${category})" >&2
@@ -141,7 +146,7 @@ check_env "WEBHOOK_SECRET"                 "secret (optional)"
 echo ""
 echo "--- ConfigMap-backed variables (envFrom configMapRef) ---"
 # Verify the ConfigMap itself is referenced in envFrom
-if echo "${RENDERED}" | grep -q "configMapRef"; then
+if grep -q "configMapRef" <<< "${RENDERED}"; then
   pass "ConfigMap is referenced via envFrom"
 else
   echo "[validate-helm-env-wiring] FAIL: no configMapRef found in rendered deployment" >&2
@@ -176,7 +181,7 @@ for var in \
   SSE_KEEPALIVE_INTERVAL_MS \
   SSE_MAX_CONNECTIONS \
   REQUEST_TIMEOUT_MS; do
-  if echo "${RENDERED}" | grep -q "${var}"; then
+  if grep -q "${var}" <<< "${RENDERED}"; then
     pass "${var} is present in ConfigMap"
   else
     echo "[validate-helm-env-wiring] FAIL: ${var} not found in rendered ConfigMap" >&2

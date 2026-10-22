@@ -7,6 +7,7 @@ jest.mock('../../src/utils/logger', () => ({
 
 import { errorHandler } from '../../src/middleware/errorHandler';
 import { ErrorCode } from '../../src/utils/errorCodes';
+import { logger } from '../../src/utils/logger';
 
 function makeReq(correlationId?: string): Request {
   return { correlationId } as unknown as Request;
@@ -35,7 +36,7 @@ describe('errorHandler', () => {
     const body = getBody(res);
     expect(body.correlationId).toBe('test-corr-id');
     expect(body.success).toBe(false);
-    expect(body.error).toBe('something went wrong');
+    expect(body.error).toBe('Internal Server Error');
   });
 
   it('omits correlationId when not present on req', () => {
@@ -98,14 +99,26 @@ describe('errorHandler', () => {
   });
 
   // ── issue #46: unexpected errors return HTTP 500 with generic message ──────
-  it('returns HTTP 500 for unexpected generic errors', () => {
+  it('returns a generic message for unexpected server errors', () => {
     const req = makeReq();
     const res = makeRes();
     errorHandler(new Error('unexpected boom'), req, res, next);
     expect((res.status as jest.Mock)).toHaveBeenCalledWith(500);
     const body = getBody(res);
     expect(body.success).toBe(false);
-    expect(body.error).toBe('unexpected boom');
+    expect(body.error).toBe('Internal Server Error');
+  });
+
+  it('logs the stack trace without exposing it in the response', () => {
+    const req = makeReq();
+    const res = makeRes();
+    const error = new Error('database connection failed');
+    errorHandler(error, req, res, next);
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining('database connection failed'),
+      error.stack,
+    );
+    expect(getBody(res).error).toBe('Internal Server Error');
   });
 
   it('returns HTTP 500 for thrown non-Zod errors', () => {

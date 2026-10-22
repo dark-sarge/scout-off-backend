@@ -19,9 +19,11 @@ export const rejectOfferSchema = z.object({
  * We look up the player_registered event for their wallet address.
  */
 function getPlayerWallet(playerId: string): string | null {
-  const event = queryEvents('player_registered').find(
-    (e) => e.payload.player_id === playerId,
-  );
+  const event = queryEvents('player_registered', {
+    payloadFilter: { player_id: playerId },
+    limit: 1,
+    offset: 0,
+  })[0];
   return event ? (event.payload.wallet as string) : null;
 }
 
@@ -69,9 +71,11 @@ async function resolveOwnedPendingOffer(
 
   if (!offer) {
     // Try to seed from on-chain indexed events (backward compatibility)
-    const event = queryEvents('trial_offer_logged').find(
-      (e) => e.payload.offer_id === offerId || e.payload.player_id === playerId,
-    );
+    const event = queryEvents('trial_offer_logged', {
+      payloadAnyOf: [{ offer_id: offerId }, { player_id: playerId }],
+      limit: 1,
+      offset: 0,
+    })[0];
     if (!event) {
       res.status(404).json({ success: false, error: 'Trial offer not found' });
       return null;

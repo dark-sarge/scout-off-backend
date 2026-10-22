@@ -1,130 +1,196 @@
-#!/usr/bin/env npx ts-node
+#!/usr/bin/env ts-node
+/**
+ * Database migration CLI
+ *
+ * Usage: node dist/migrate.js <command>
+ *
+ * Commands:
+ *   up       Run all pending migrations
+ *   status   Show migration status (exit 0 if up-to-date, 2 if behind)
+ *   version  Print current schema version (file id of last applied migration)
+ *
+ * Exit codes:
+ *   0  Success
+ *   1  Error (including failed migration)
+ *   2  Migrations are behind expected schema (only for status)
+ *
+ * Logs are emitted as JSON to stdout.
+ */
 
-import 'dotenv/config';
-import path from 'path';
+import { runMigrations, getAppliedMigrations, getExpectedSchemaVersion } from '../src/db/migrate';
 import Database from 'better-sqlite3';
-import { PostgresDriver } from '../src/db/postgres-driver';
+import { DbDriver } from '../src/db/driver';
 import { SqliteDriver } from '../src/db/sqlite-driver';
-import { runMigrations, RunMigrationsOptions, MigrationDirection } from '../src/db/migrate';
+import { PostgresDriver } from '../src/db/postgres-driver';
 import config from '../src/config';
+import { logger } from '../src/utils/logger';
 
-interface CliOptions {
-  direction?: MigrationDirection;
-  steps?: number;
-  dryRun?: boolean;
-  dbPath?: string;
+interface LogEntry {
+  level: string;
+  message: string;
+  timestamp: string;
+  [key: string]: unknown;
 }
 
-function parseArgs(): CliOptions {
-  const args = process.argv.slice(2);
-  const options: CliOptions = {};
+function log(level: string, message: string, extra: Record<string, unknown> = {}): void {
+  const entry: LogEntry = {
+    level,
+    message,
+    timestamp: new Date().toISOString(),
+    ...extra
+  };
+  console.log(JSON.stringify(entry));
+}
 
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-
-    if (arg === '--direction' || arg === '-d') {
-      const value = args[i + 1];
-      if (value === 'up' || value === 'down') {
-        options.direction = value;
-        i++;
-      }
-    } else if (arg === '--steps' || arg === '-s') {
-      const value = args[i + 1];
-      const parsed = parseInt(value, 10);
-      if (!isNaN(parsed)) {
-        options.steps = parsed;
-        i++;
-      }
-    } else if (arg === '--dry-run') {
-      options.dryRun = true;
-    } else if (arg === '--db-path') {
-      options.dbPath = args[i + 1];
-      i++;
-    } else if (arg === '--help' || arg === '-h') {
-      printHelp();
-      process.exit(0);
+async function getDriver(): Promise<DbDriver> {
+  if (config.dbDriver === 'postgres') {
+    if (!config.databaseUrl) {
+      throw new Error('DATABASE_URL is required when DB_DRIVER=postgres');
     }
+    const driver = new PostgresDriver(config.databaseUrl, config.databaseSsl);
+    await driver.connect();
+    return driver;
+  } else {
+    const sqliteDriver = new SqliteDriver(new Database(config.dbPath));
+    return sqliteDriver;
   }
-
-  return options;
 }
 
-function printHelp(): void {
-  console.log(`
-Usage: npm run migrate -- [options]
-
-Options:
-  -d, --direction <up|down>   Migration direction (default: up)
-  -s, --steps <number>        Number of migrations to apply/revert (default: all)
-  --dry-run                   Print SQL without executing
-  --db-path <path>            SQLite database file path (default: scout-off.db)
-  -h, --help                  Show this help message
-
-Examples:
-  npm run migrate -- --direction up
-  npm run migrate -- --direction down --steps 1
-  npm run migrate -- --dry-run
-  npm run migrate -- --direction up --steps 3 --dry-run
-`);
-}
-
-async function main(): Promise<void> {
+async function cmdUp(): Promise<number> {
+  log('info', 'Starting database migrations');
+  
+  let driver: DbDriver | null = null;
+  
   try {
-    const options = parseArgs();
-
-    const direction = options.direction || 'up';
-    const steps = options.steps;
-    const dryRun = options.dryRun || false;
-
-    let driver: SqliteDriver | PostgresDriver;
-
-    if (config.dbDriver === 'postgres') {
-      if (!process.env.DATABASE_URL) {
-        console.error('ERROR: DATABASE_URL environment variable is required for PostgreSQL');
-        process.exit(1);
-      }
-
-      const ssl = process.env.DATABASE_SSL === 'true' 
-        ? true 
-        : process.env.DATABASE_SSL === 'no-verify' 
-          ? 'no-verify' 
-          : false;
-
-      driver = new PostgresDriver(process.env.DATABASE_URL, ssl);
-      await driver.connect();
-    } else {
-      const dbPath = options.dbPath || process.env.DB_PATH || 'scout-off.db';
-      const db = new Database(dbPath);
-      driver = new SqliteDriver(db);
+    driver = await getDriver();
+    
+    const results = await runMigrations(driver);
+    const newlyApplied = results.filter((r) => r.applied).map((r) => r.filename);
+    
+    log('info', `Migration complete. Applied ${newlyApplied.length} migration(s)`);
+    
+    if (newlyApplied.length > 0) {
+      log('info', 'Applied migrations:', { migrations: newlyApplied });
     }
-
-    console.log(`Running migrations: direction=${direction}${steps ? `, steps=${steps}` : ''}${dryRun ? ', dry-run=true' : ''}`);
-
-    const results = await runMigrations(driver, { direction, steps, dryRun });
-
-    if (results.length === 0) {
-      console.log('No migrations to apply.');
-    } else {
-      for (const result of results) {
-        if (result.applied) {
-          console.log(`${dryRun ? '[DRY RUN] ' : ''}Applied: ${result.filename}`);
-        } else {
-          console.error(`FAILED: ${result.filename} - ${result.error}`);
-        }
-      }
-
-      if (!dryRun) {
-        console.log(`\nSuccessfully ${direction === 'up' ? 'applied' : 'reverted'} ${results.filter(r => r.applied).length} migration(s).`);
+    
+    return 0;
+  } catch (err) {
+    log('error', 'Migration failed', { error: err instanceof Error ? err.message : String(err) });
+    return 1;
+  } finally {
+    if (driver) {
+      try {
+        await driver.close();
+      } catch {
+        // Ignore close errors
       }
     }
-
-    await driver.close();
-    process.exit(0);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error('Migration failed:', message);
-    process.exit(1);
   }
 }
 
-main();
+async function cmdStatus(): Promise<number> {
+  log('info', 'Checking migration status');
+  
+  let driver: DbDriver | null = null;
+  
+  try {
+    driver = await getDriver();
+    
+    const applied = [...(await getAppliedMigrations(driver)).keys()].sort();
+    const expected = getExpectedSchemaVersion();
+    
+    log('info', 'Migration status', { 
+      appliedCount: applied.length, 
+      expectedVersion: expected,
+      lastApplied: applied[applied.length - 1] ?? 'none'
+    });
+    
+    if (applied.length < expected.migrations.length) {
+      log('warn', 'Schema is behind - pending migrations detected');
+      return 2;
+    }
+    
+    log('info', 'Schema is up to date');
+    return 0;
+  } catch (err) {
+    log('error', 'Failed to check migration status', { 
+      error: err instanceof Error ? err.message : String(err) 
+    });
+    return 1;
+  } finally {
+    if (driver) {
+      try {
+        await driver.close();
+      } catch {
+        // Ignore close errors
+      }
+    }
+  }
+}
+
+async function cmdVersion(): Promise<number> {
+  log('info', 'Checking current schema version');
+  
+  let driver: DbDriver | null = null;
+  
+  try {
+    driver = await getDriver();
+    
+    const applied = [...(await getAppliedMigrations(driver)).keys()].sort();
+    const expected = getExpectedSchemaVersion();
+    
+    const currentVersion = applied.length > 0 ? applied[applied.length - 1] : 'none';
+    const expectedVersion = expected.migrations.length > 0 ? expected.migrations[expected.migrations.length - 1] : 'none';
+    
+    log('info', 'Schema version info', {
+      currentVersion,
+      expectedVersion,
+      migrationsBehind: Math.max(0, expected.migrations.length - applied.length)
+    });
+    
+    return 0;
+  } catch (err) {
+    log('error', 'Failed to get schema version', { 
+      error: err instanceof Error ? err.message : String(err) 
+    });
+    return 1;
+  } finally {
+    if (driver) {
+      try {
+        await driver.close();
+      } catch {
+        // Ignore close errors
+      }
+    }
+  }
+}
+
+// Exported for use in app.ts
+export { getAppliedMigrations, getExpectedSchemaVersion };
+
+// Main entry point
+const command = process.argv[2] || 'up';
+
+const commands: Record<string, () => Promise<number>> = {
+  up: cmdUp,
+  status: cmdStatus,
+  version: cmdVersion,
+};
+
+switch (command) {
+  case 'up':
+  case 'status':
+  case 'version':
+    void commands[command]().then((code) => {
+      process.exitCode = code;
+    });
+    break;
+  default:
+    console.error(JSON.stringify({
+      level: 'error',
+      message: 'Unknown command. Use "up", "status", or "version"',
+      command
+    }));
+    process.exitCode = 1;
+    break;
+}

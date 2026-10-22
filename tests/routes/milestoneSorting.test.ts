@@ -216,7 +216,9 @@ describe('GET /api/players/:playerId/milestones - status filter', () => {
     const res = await request(app).get('/api/players/player-1/milestones?status=rejected');
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
-    expect(queryEvents).toHaveBeenCalledWith('milestone_rejected');
+    expect(queryEvents).toHaveBeenCalledWith('milestone_rejected', {
+      payloadFilter: { player_id: 'player-1' },
+    });
     const statuses: string[] = res.body.data.map((m: any) => m.status);
     expect(statuses.every((s) => s === 'rejected')).toBe(true);
     expect(statuses).toHaveLength(2);

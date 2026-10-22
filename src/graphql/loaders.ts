@@ -43,7 +43,9 @@ async function batchLoadMilestones(
   playerIds: readonly string[],
 ): Promise<GqlMilestone[][]> {
   // ── Step 1: index-based milestones (synchronous, very cheap) ──────────────
-  const allIndexed = queryEvents('milestone_approved');
+  const allIndexed = queryEvents('milestone_approved', {
+    payloadIn: { player_id: [...playerIds] },
+  });
 
   const indexedByPlayer = new Map<string, GqlMilestone[]>();
   for (const ev of allIndexed) {

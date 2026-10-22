@@ -22,6 +22,14 @@ import { EventBroadcaster, broadcaster } from '../../src/services/eventBroadcast
 import { revokeToken } from '../../src/services/tokenBlocklist';
 import { blocklistWallet, unblocklistWallet, _resetWalletBlocklistForTests } from '../../src/services/walletBlocklist';
 
+// The stream resolves the connecting wallet's player (cuid2) and matches
+// player-scoped events on payload.player_id. These tests broadcast payloads
+// keyed by wallet, so map each wallet to a player whose ID is that wallet.
+jest.mock('../../src/db', () => ({
+  ...jest.requireActual('../../src/db'),
+  getPlayerByWallet: jest.fn(async (wallet: string) => ({ player_id: wallet, wallet })),
+}));
+
 const SECRET = process.env.JWT_SECRET ?? 'test-secret';
 
 const WALLET_A = 'GAWALLETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
@@ -274,8 +282,13 @@ describe('SSE — wallet blocklisting terminates the stream', () => {
       '/api/events/stream',
       makeToken(WALLET_A),
     );
+    await conn.waitForChunks(1);
     conn.destroy();
     expect(statusCode).toBe(403);
+    expect(JSON.parse(conn.chunks.join(''))).toMatchObject({
+      success: false,
+      code: 'WALLET_BLOCKLISTED',
+    });
   });
 
   it('allows the wallet again after it is unblocked', async () => {

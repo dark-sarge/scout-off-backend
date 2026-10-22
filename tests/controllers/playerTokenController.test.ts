@@ -11,15 +11,22 @@ import {
   getPlayerTokenHolders,
   _stubSeedTokens,
   _stubReset,
-  _stubResetMutexes,
 } from '../../src/controllers/playerTokenController';
 import { clearFeatureFlagCache, setFeatureFlag } from '../../src/services/featureFlags';
 import { FeatureFlags } from '../../src/services/featureFlags';
 
 // ── Mock helpers ──────────────────────────────────────────────────────────────
 
-function mockReqRes(playerId: string, body: unknown = {}) {
-  const req = { params: { playerId }, body } as any;
+function mockReqRes(
+  playerId: string,
+  body: unknown = {},
+  account: string | null | undefined = (body as { buyerWallet?: string })?.buyerWallet,
+) {
+  const req = {
+    params: { playerId },
+    body,
+    account,
+  } as any;
   let statusCode = 200;
   let responseBody: unknown;
   const res = {
@@ -50,11 +57,10 @@ function mockReqRes(playerId: string, body: unknown = {}) {
 // ── Test suite ────────────────────────────────────────────────────────────────
 
 describe('playerTokenController', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     // Enable the feature flag so the guards pass.
     setFeatureFlag(FeatureFlags.PLAYER_TOKENS, true, 'test');
-    _stubReset();
-    _stubResetMutexes();
+    await _stubReset();
   });
 
   afterEach(() => {
@@ -86,9 +92,9 @@ describe('playerTokenController', () => {
   // ── getPlayerTokenHolders ───────────────────────────────────────────────────
 
   describe('getPlayerTokenHolders', () => {
-    it('returns 404 when no tokens have been issued', () => {
+    it('returns 404 when no tokens have been issued', async () => {
       const { req, res, next, getStatus, getBody } = mockReqRes('unknown-player');
-      getPlayerTokenHolders(req, res, next);
+      await getPlayerTokenHolders(req, res, next);
 
       expect(getStatus()).toBe(404);
       expect(getBody().success).toBe(false);
@@ -96,16 +102,16 @@ describe('playerTokenController', () => {
     });
 
     it('returns holder list and supply info for a seeded player', async () => {
-      _stubSeedTokens('player-a', 100);
+      await _stubSeedTokens('player-a', 100);
 
       // Buy some tokens first so holders list is non-empty.
-      const buyReq = { params: { playerId: 'player-a' }, body: { amount: 10, buyerWallet: 'WALLET_A' } } as any;
+      const buyReq = { params: { playerId: 'player-a' }, body: { amount: 10, buyerWallet: 'WALLET_A' }, account: 'WALLET_A' } as any;
       let ignored: unknown;
       const buyRes = { status: () => buyRes, json: (d: unknown) => { ignored = d; } } as any;
       await buyPlayerToken(buyReq, buyRes, jest.fn());
 
       const { req, res, getStatus, getBody } = mockReqRes('player-a');
-      getPlayerTokenHolders(req, res, jest.fn());
+      await getPlayerTokenHolders(req, res, jest.fn());
 
       expect(getStatus()).toBe(200);
       const data = getBody().data;
@@ -120,7 +126,7 @@ describe('playerTokenController', () => {
 
   describe('buyPlayerToken — happy path', () => {
     it('records a purchase and returns the new balance', async () => {
-      _stubSeedTokens('player-1', 50);
+      await _stubSeedTokens('player-1', 50);
 
       const { req, res, next, getStatus, getBody } = mockReqRes('player-1', {
         amount: 10,
@@ -138,7 +144,7 @@ describe('playerTokenController', () => {
     });
 
     it('accumulates balance across multiple purchases by the same buyer', async () => {
-      _stubSeedTokens('player-2', 100);
+      await _stubSeedTokens('player-2', 100);
 
       for (let i = 0; i < 3; i++) {
         const { req, res, next } = mockReqRes('player-2', {
@@ -151,14 +157,14 @@ describe('playerTokenController', () => {
 
       // Check the final state via getPlayerTokenHolders.
       const { req, res, getBody } = mockReqRes('player-2');
-      getPlayerTokenHolders(req, res, jest.fn());
+      await getPlayerTokenHolders(req, res, jest.fn());
       const holders = getBody().data.holders as Array<{ holder: string; tokens: number }>;
       const entry = holders.find((h) => h.holder === 'WALLET_SAME');
       expect(entry?.tokens).toBe(15);
     });
 
     it('allows buying the entire remaining supply in one request', async () => {
-      _stubSeedTokens('player-3', 20);
+      await _stubSeedTokens('player-3', 20);
 
       const { req, res, next, getStatus, getBody } = mockReqRes('player-3', {
         amount: 20,
@@ -185,8 +191,38 @@ describe('playerTokenController', () => {
       expect(getBody().success).toBe(false);
     });
 
+    it('rejects a buyerWallet that differs from the authenticated account', async () => {
+      await _stubSeedTokens('player-auth', 10);
+      const { req, res, next, getStatus, getBody } = mockReqRes(
+        'player-auth',
+        { amount: 1, buyerWallet: 'SPOOFED_BUYER' },
+        'AUTHENTICATED_BUYER',
+      );
+
+      await buyPlayerToken(req, res, next);
+
+      expect(getStatus()).toBe(403);
+      expect(getBody().success).toBe(false);
+      expect(next).not.toHaveBeenCalled();
+    });
+
+    it('rejects a request without an authenticated account', async () => {
+      await _stubSeedTokens('player-unauthenticated', 10);
+      const { req, res, next, getStatus, getBody } = mockReqRes(
+        'player-unauthenticated',
+        { amount: 1, buyerWallet: 'BODY_BUYER' },
+        null,
+      );
+
+      await buyPlayerToken(req, res, next);
+
+      expect(getStatus()).toBe(401);
+      expect(getBody().success).toBe(false);
+      expect(next).not.toHaveBeenCalled();
+    });
+
     it('returns 400 when amount is missing from body', async () => {
-      _stubSeedTokens('player-4', 50);
+      await _stubSeedTokens('player-4', 50);
 
       const { req, res, next, getStatus, getBody } = mockReqRes('player-4', {
         buyerWallet: 'WALLET_Z',
@@ -197,20 +233,20 @@ describe('playerTokenController', () => {
       expect(getBody().success).toBe(false);
     });
 
-    it('returns 400 when buyerWallet is missing from body', async () => {
-      _stubSeedTokens('player-5', 50);
+    it('uses the authenticated wallet when buyerWallet is omitted from body', async () => {
+      await _stubSeedTokens('player-5', 50);
 
       const { req, res, next, getStatus, getBody } = mockReqRes('player-5', {
         amount: 5,
-      });
+      }, 'AUTHENTICATED_BUYER');
       await buyPlayerToken(req, res, next);
 
-      expect(getStatus()).toBe(400);
-      expect(getBody().success).toBe(false);
+      expect(getStatus()).toBe(200);
+      expect(getBody().data.buyerWallet).toBe('AUTHENTICATED_BUYER');
     });
 
     it('returns 400 when amount is zero', async () => {
-      _stubSeedTokens('player-6', 50);
+      await _stubSeedTokens('player-6', 50);
 
       const { req, res, next, getStatus, getBody } = mockReqRes('player-6', {
         amount: 0,
@@ -223,7 +259,7 @@ describe('playerTokenController', () => {
     });
 
     it('returns 400 when amount is negative', async () => {
-      _stubSeedTokens('player-7', 50);
+      await _stubSeedTokens('player-7', 50);
 
       const { req, res, next, getStatus, getBody } = mockReqRes('player-7', {
         amount: -5,
@@ -236,7 +272,7 @@ describe('playerTokenController', () => {
     });
 
     it('returns 409 with TOKEN_SUPPLY_EXHAUSTED code when amount exceeds remaining supply', async () => {
-      _stubSeedTokens('player-8', 5);
+      await _stubSeedTokens('player-8', 5);
 
       // First, exhaust the supply.
       const { req: r1, res: res1, next: n1 } = mockReqRes('player-8', {
@@ -271,7 +307,7 @@ describe('playerTokenController', () => {
      */
     it('serialises concurrent purchases and never oversells the supply', async () => {
       const playerId = 'concurrency-player';
-      _stubSeedTokens(playerId, 10);
+      await _stubSeedTokens(playerId, 10);
 
       const CONCURRENT = 10;
       const AMOUNT_EACH = 8;
@@ -315,15 +351,15 @@ describe('playerTokenController', () => {
 
       // Total sold must never exceed supply.
       const { req, res } = mockReqRes(playerId);
-      getPlayerTokenHolders(req, res, jest.fn());
+      await getPlayerTokenHolders(req, res, jest.fn());
       const holdersData = (res as any).responseBody?.data;
       expect(holdersData.soldTokens).toBeLessThanOrEqual(10);
       expect(holdersData.soldTokens).toBe(AMOUNT_EACH); // exactly 8 were sold
     });
 
     it('allows concurrent purchases for different players without interference', async () => {
-      _stubSeedTokens('player-alpha', 5);
-      _stubSeedTokens('player-beta', 5);
+      await _stubSeedTokens('player-alpha', 5);
+      await _stubSeedTokens('player-beta', 5);
 
       // Each player gets one buyer requesting 5 tokens simultaneously.
       const [callA, callB] = ['player-alpha', 'player-beta'].map((id) => {

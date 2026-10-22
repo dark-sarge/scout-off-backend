@@ -14,8 +14,8 @@
 /// Each proptest! block runs 10 000 cases (ProptestConfig::with_cases).
 #[cfg(test)]
 mod progress_invariants {
-    use proptest::prelude::*;
     use progress::{ProgressContract, ProgressContractClient};
+    use proptest::prelude::*;
     use register::{RegisterContract, RegisterContractClient};
     use soroban_sdk::{testutils::Address as _, Address, Env, String};
 

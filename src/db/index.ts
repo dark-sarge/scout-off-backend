@@ -8,6 +8,7 @@ import { runMigrations } from './migrate';
 import { logger } from '../utils/logger';
 import { computeChainHash, auditChainContent, GENESIS_HASH } from '../utils/hashChain';
 import { encryptWebhookSecret, decryptWebhookSecret } from '../utils/webhookSecretCipher';
+import { decryptField, encryptField } from '../utils/fieldCipher';
 import { DbDriver } from './driver';
 import { SqliteDriver } from './sqlite-driver';
 import { PostgresDriver } from './postgres-driver';
@@ -16,6 +17,7 @@ import {
   createBetterSqlite3LoadError,
   isBetterSqlite3LoadFailure,
 } from './betterSqlite3Error';
+import { ApiKeyLimitError, MAX_API_KEYS_PER_SCOUT, MAX_WEBHOOK_SUBSCRIPTIONS_PER_SCOUT, WebhookSubscriptionLimitError } from '../utils/scoutResourceLimits';
 
 const dbTracer = trace.getTracer('scout-off-backend');
 
@@ -111,7 +113,11 @@ export async function initDb(): Promise<void> {
       );
     }
 
-    const pgDriver = new PostgresDriver(config.databaseUrl, config.databaseSsl, config.databasePoolSize);
+    const pgDriver = new PostgresDriver(config.databaseUrl, config.databaseSsl, config.databasePoolSize, {
+      statementTimeoutMs: config.databaseStatementTimeoutMs,
+      queryTimeoutMs: config.databaseQueryTimeoutMs,
+      idleInTransactionSessionTimeoutMs: config.databaseIdleTransactionTimeoutMs,
+    });
     await pgDriver.connect();
     _driver = pgDriver;
 
@@ -139,10 +145,10 @@ export async function initDb(): Promise<void> {
     }
     // WAL mode lets readers and a writer proceed concurrently instead of
     // blocking each other on the default rollback journal, and busy_timeout
-    // makes a writer that does contend for the single write lock retry for
-    // up to 5s instead of failing immediately with SQLITE_BUSY.
+    // makes a writer that contends for the single write lock retry for a
+    // bounded, configurable period instead of failing immediately with SQLITE_BUSY.
     sqliteDb.pragma('journal_mode = WAL');
-    sqliteDb.pragma('busy_timeout = 5000');
+    sqliteDb.pragma(`busy_timeout = ${config.sqliteBusyTimeoutMs}`);
     _db = sqliteDb;
     _driver = new SqliteDriver(sqliteDb);
 
@@ -278,6 +284,64 @@ interface EventRow {
 export interface GetEventsOptions {
   limit?: number;
   offset?: number;
+  payloadFilter?: EventPayloadFilter;
+  payloadAnyOf?: EventPayloadFilter[];
+  payloadIn?: Record<string, Array<string | number | boolean | null>>;
+  createdAfter?: number;
+}
+
+export type EventPayloadFilter = Record<string, string | number | boolean | null>;
+
+function eventPayloadPredicate(
+  filters: Pick<GetEventsOptions, 'payloadFilter' | 'payloadAnyOf' | 'payloadIn' | 'createdAfter'>,
+): { sql: string; params: unknown[] } {
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  const column = (field: string): string => {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(field)) {
+      throw new Error(`Invalid event payload field: ${field}`);
+    }
+    return `json_extract(payload, '$."${field}"')`;
+  };
+
+  for (const [field, value] of Object.entries(filters.payloadFilter ?? {})) {
+    clauses.push(`${column(field)} = ?`);
+    params.push(value);
+  }
+
+  if (filters.payloadAnyOf?.length) {
+    const alternatives = filters.payloadAnyOf.map((filter) => {
+      const entries = Object.entries(filter);
+      if (entries.length === 0) {
+        throw new Error('Event payload alternatives must not be empty');
+      }
+      const conjunction = entries.map(([field, value]) => {
+        params.push(value);
+        return `${column(field)} = ?`;
+      });
+      return `(${conjunction.join(' AND ')})`;
+    });
+    clauses.push(`(${alternatives.join(' OR ')})`);
+  }
+
+  for (const [field, values] of Object.entries(filters.payloadIn ?? {})) {
+    if (values.length === 0) {
+      clauses.push('1 = 0');
+      continue;
+    }
+    clauses.push(`${column(field)} IN (${values.map(() => '?').join(', ')})`);
+    params.push(...values);
+  }
+
+  if (filters.createdAfter !== undefined) {
+    clauses.push('created_at >= ?');
+    params.push(filters.createdAfter);
+  }
+
+  return {
+    sql: clauses.length > 0 ? ` AND ${clauses.join(' AND ')}` : '',
+    params,
+  };
 }
 
 export function queryEvents(
@@ -287,25 +351,26 @@ export function queryEvents(
   const db = getDb();
   const { limit, offset } = opts ?? {};
   const hasPagination = limit !== undefined && offset !== undefined;
+  const payloadPredicate = eventPayloadPredicate(opts ?? {});
 
   let sql: string;
   let rows: EventRow[];
   if (type && hasPagination) {
     // sql-injection-check-ignore: EVENTS_ORDER_BY_SQL is a hardcoded ORDER BY fragment; values are bound via params.
-    sql = `SELECT * FROM events WHERE type = ? ORDER BY ${EVENTS_ORDER_BY_SQL} LIMIT ? OFFSET ?`;
-    rows = timedQuery(sql, () => db.prepare(sql).all(type, limit, offset) as EventRow[]);
+    sql = `SELECT * FROM events WHERE type = ?${payloadPredicate.sql} ORDER BY ${EVENTS_ORDER_BY_SQL} LIMIT ? OFFSET ?`;
+    rows = timedQuery(sql, () => db.prepare(sql).all(type, ...payloadPredicate.params, limit, offset) as EventRow[]);
   } else if (type) {
     // sql-injection-check-ignore: EVENTS_ORDER_BY_SQL is a hardcoded ORDER BY fragment; values are bound via params.
-    sql = `SELECT * FROM events WHERE type = ? ORDER BY ${EVENTS_ORDER_BY_SQL}`;
-    rows = timedQuery(sql, () => db.prepare(sql).all(type) as EventRow[]);
+    sql = `SELECT * FROM events WHERE type = ?${payloadPredicate.sql} ORDER BY ${EVENTS_ORDER_BY_SQL}`;
+    rows = timedQuery(sql, () => db.prepare(sql).all(type, ...payloadPredicate.params) as EventRow[]);
   } else if (hasPagination) {
     // sql-injection-check-ignore: EVENTS_ORDER_BY_SQL is a hardcoded ORDER BY fragment; values are bound via params.
-    sql = `SELECT * FROM events ORDER BY ${EVENTS_ORDER_BY_SQL} LIMIT ? OFFSET ?`;
-    rows = timedQuery(sql, () => db.prepare(sql).all(limit, offset) as EventRow[]);
+    sql = `SELECT * FROM events WHERE 1 = 1${payloadPredicate.sql} ORDER BY ${EVENTS_ORDER_BY_SQL} LIMIT ? OFFSET ?`;
+    rows = timedQuery(sql, () => db.prepare(sql).all(...payloadPredicate.params, limit, offset) as EventRow[]);
   } else {
     // sql-injection-check-ignore: EVENTS_ORDER_BY_SQL is a hardcoded ORDER BY fragment; values are bound via params.
-    sql = `SELECT * FROM events ORDER BY ${EVENTS_ORDER_BY_SQL}`;
-    rows = timedQuery(sql, () => db.prepare(sql).all() as EventRow[]);
+    sql = `SELECT * FROM events WHERE 1 = 1${payloadPredicate.sql} ORDER BY ${EVENTS_ORDER_BY_SQL}`;
+    rows = timedQuery(sql, () => db.prepare(sql).all(...payloadPredicate.params) as EventRow[]);
   }
 
   return rows.map((r) => ({
@@ -328,14 +393,19 @@ export function rollbackEventsFromLedger(ledger: number): void {
   db.prepare('DELETE FROM events WHERE ledger >= ?').run(ledger);
 }
 
-export function getEventsCount(type?: ContractEventType): number {
+export function getEventsCount(
+  type?: ContractEventType,
+  filters?: Pick<GetEventsOptions, 'payloadFilter' | 'payloadAnyOf' | 'payloadIn' | 'createdAfter'>,
+): number {
   const db = getDb();
+  const payloadPredicate = eventPayloadPredicate(filters ?? {});
   const sql = type
-    ? 'SELECT COUNT(*) AS count FROM events WHERE type = ?'
-    : 'SELECT COUNT(*) AS count FROM events';
-  const row = type
-    ? timedQuery(sql, () => db.prepare(sql).get(type) as { count: number } | undefined)
-    : timedQuery(sql, () => db.prepare(sql).get() as { count: number } | undefined);
+    // sql-injection-check-ignore: payloadPredicate.sql is built from validated field names and `?` placeholders; values are bound via params.
+    ? `SELECT COUNT(*) AS count FROM events WHERE type = ?${payloadPredicate.sql}`
+    // sql-injection-check-ignore: payloadPredicate.sql is built from validated field names and `?` placeholders; values are bound via params.
+    : `SELECT COUNT(*) AS count FROM events WHERE 1 = 1${payloadPredicate.sql}`;
+  const params = type ? [type, ...payloadPredicate.params] : payloadPredicate.params;
+  const row = timedQuery(sql, () => db.prepare(sql).get(...params) as { count: number } | undefined);
   return row?.count ?? 0;
 }
 
@@ -606,6 +676,7 @@ export function* getEventsIterable(filter: EventsPageFilter): Generator<EventExp
 
 export interface PlayerRow {
   player_id: string;
+  on_chain_player_id: string | null;
   wallet: string;
   position: string | null;
   region: string | null;
@@ -679,6 +750,7 @@ export async function getPlayerProfileHistoryVersioned(
 
 export async function insertOrUpdatePlayer(p: {
   player_id: string;
+  on_chain_player_id?: string | null;
   wallet: string;
   position?: string;
   region?: string;
@@ -686,15 +758,16 @@ export async function insertOrUpdatePlayer(p: {
   created_at?: number;
   registered_at?: number;
 }): Promise<void> {
-  const sql = `INSERT INTO players (player_id, wallet, position, region, metadata_uri, created_at, registered_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+  const sql = `INSERT INTO players (player_id, on_chain_player_id, wallet, position, region, metadata_uri, created_at, registered_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(player_id) DO UPDATE SET
+         on_chain_player_id = COALESCE(excluded.on_chain_player_id, players.on_chain_player_id),
          wallet       = excluded.wallet,
          position     = excluded.position,
          region       = excluded.region,
          metadata_uri = excluded.metadata_uri`;
   await timedQueryAsync(sql, () =>
-    getDriver().run(sql, [p.player_id, p.wallet, p.position ?? null, p.region ?? null, p.metadata_uri ?? null, p.created_at ?? null, p.registered_at ?? 0])
+    getDriver().run(sql, [p.player_id, p.on_chain_player_id ?? null, p.wallet, p.position ?? null, p.region ?? null, p.metadata_uri ?? null, p.created_at ?? null, p.registered_at ?? 0])
   );
 }
 
@@ -859,6 +932,136 @@ export async function getPlayerByWallet(wallet: string): Promise<PlayerRow | nul
   return timedQueryAsync(sql, async () =>
     (await getDriver().get<PlayerRow>(sql, [wallet])) ?? null
   );
+}
+
+export async function getPlayerByOnChainId(onChainPlayerId: string): Promise<PlayerRow | null> {
+  const sql = 'SELECT * FROM players WHERE on_chain_player_id = ?';
+  return timedQueryAsync(sql, async () =>
+    (await getDriver().get<PlayerRow>(sql, [onChainPlayerId])) ?? null
+  );
+}
+
+export async function getPlayersMissingOnChainId(
+  afterPlayerId: string,
+  limit: number,
+): Promise<PlayerRow[]> {
+  const sql = `SELECT * FROM players
+               WHERE on_chain_player_id IS NULL AND player_id > ?
+               ORDER BY player_id LIMIT ?`;
+  return timedQueryAsync(sql, () => getDriver().all<PlayerRow>(sql, [afterPlayerId, limit]));
+}
+
+export async function setPlayerOnChainId(
+  playerId: string,
+  onChainPlayerId: string,
+): Promise<void> {
+  const sql = `UPDATE players SET on_chain_player_id = ?
+               WHERE player_id = ? AND (on_chain_player_id IS NULL OR on_chain_player_id = ?)`;
+  await timedQueryAsync(sql, () =>
+    getDriver().run(sql, [onChainPlayerId, playerId, onChainPlayerId]),
+  );
+  const player = await getPlayerById(playerId);
+  if (!player || player.on_chain_player_id !== onChainPlayerId) {
+    throw new Error(`Player ${playerId} already has a different on-chain ID mapping`);
+  }
+}
+
+// ─── Player token registry ───────────────────────────────────────────────────
+
+export interface PlayerTokenHolderRow {
+  holder_wallet: string;
+  token_balance: number | string;
+}
+
+export interface PlayerTokenInventory {
+  totalSupply: number;
+  soldTokens: number;
+  holders: Array<{ holder: string; tokens: number }>;
+}
+
+export type PlayerTokenPurchaseResult =
+  | { status: 'not_found' }
+  | { status: 'exhausted'; remaining: number }
+  | { status: 'purchased'; newBalance: number };
+
+export async function seedPlayerTokenSupply(
+  playerId: string,
+  totalSupply: number,
+): Promise<void> {
+  const sql = `INSERT INTO player_token_supply (player_id, total_supply)
+               VALUES (?, ?)
+               ON CONFLICT(player_id) DO UPDATE SET total_supply = excluded.total_supply`;
+  await timedQueryAsync(sql, () => getDriver().run(sql, [playerId, totalSupply]));
+}
+
+export async function getPlayerTokenInventory(
+  playerId: string,
+): Promise<PlayerTokenInventory | null> {
+  const supplySql = 'SELECT total_supply FROM player_token_supply WHERE player_id = ?';
+  const supply = await timedQueryAsync(supplySql, () =>
+    getDriver().get<{ total_supply: number | string }>(supplySql, [playerId]),
+  );
+  if (!supply) return null;
+
+  const holdersSql = `SELECT holder_wallet, token_balance
+                      FROM player_token_balances
+                      WHERE player_id = ?
+                      ORDER BY holder_wallet`;
+  const rows = await timedQueryAsync(holdersSql, () =>
+    getDriver().all<PlayerTokenHolderRow>(holdersSql, [playerId]),
+  );
+  const holders = rows.map((row) => ({
+    holder: row.holder_wallet,
+    tokens: Number(row.token_balance),
+  }));
+
+  return {
+    totalSupply: Number(supply.total_supply),
+    soldTokens: holders.reduce((total, row) => total + row.tokens, 0),
+    holders,
+  };
+}
+
+export async function purchasePlayerTokens(
+  playerId: string,
+  buyerWallet: string,
+  amount: number,
+): Promise<PlayerTokenPurchaseResult> {
+  return getDriver().transaction(async (tx) => {
+    await tx.lockForWrite(`player-token:${playerId}`);
+
+    const supply = await tx.get<{ total_supply: number | string }>(
+      'SELECT total_supply FROM player_token_supply WHERE player_id = ?',
+      [playerId],
+    );
+    if (!supply) return { status: 'not_found' };
+
+    const sold = await tx.value<number | string>(
+      'SELECT COALESCE(SUM(token_balance), 0) FROM player_token_balances WHERE player_id = ?',
+      [playerId],
+    );
+    const remaining = Number(supply.total_supply) - Number(sold ?? 0);
+    if (amount > remaining) return { status: 'exhausted', remaining };
+
+    const balanceSql = `INSERT INTO player_token_balances (player_id, holder_wallet, token_balance)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(player_id, holder_wallet) DO UPDATE
+                        SET token_balance = player_token_balances.token_balance + excluded.token_balance`;
+    await tx.run(balanceSql, [playerId, buyerWallet, amount]);
+
+    const balance = await tx.value<number | string>(
+      'SELECT token_balance FROM player_token_balances WHERE player_id = ? AND holder_wallet = ?',
+      [playerId, buyerWallet],
+    );
+    return { status: 'purchased', newBalance: Number(balance) };
+  });
+}
+
+export async function resetPlayerTokenRegistry(): Promise<void> {
+  await getDriver().transaction(async (tx) => {
+    await tx.run('DELETE FROM player_token_balances');
+    await tx.run('DELETE FROM player_token_supply');
+  });
 }
 
 export async function deactivatePlayer(playerId: string): Promise<void> {
@@ -1123,9 +1326,28 @@ export interface IdempotencyRecord {
    * endpoints that don't opt into fingerprint conflict detection.
    */
   request_fingerprint: string | null;
+  /**
+   * Lease expiry (Unix ms). While status='pending' and locked_until > now,
+   * concurrent callers cannot re-claim this key. NULL means no lease (legacy).
+   */
+  locked_until?: number | null;
+}
+
+/**
+ * Delete a pending idempotency record without persisting a response.
+ * Used when a streaming handler calls res.end without res.json, or when the
+ * request handler throws before sending a response. Releases the lease so the
+ * key can be re-used immediately by a retry.
+ */
+export async function releaseIdempotencyKey(key: string): Promise<void> {
+  const sql = 'DELETE FROM idempotency_keys WHERE key = ? AND status = ?';
+  await timedQueryAsync(sql, () =>
+    getDriver().run(sql, [key, 'pending'])
+  );
 }
 
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const IDEMPOTENCY_LEASE_MS = config.idempotencyLeaseMs; // Lease expiry (ms)
 
 /**
  * Look up a non-expired idempotency key regardless of its status.
@@ -1140,50 +1362,124 @@ export async function getIdempotencyRecord(key: string): Promise<IdempotencyReco
 }
 
 /**
- * Attempt to claim an idempotency key by inserting a 'pending' marker.
+ * Attempt to claim an idempotency key by inserting a 'pending' marker, or
+ * re-claiming an expired lease. The lease mechanism allows a crashed or hung
+ * request to release its claim so a retry can proceed before the 24 h TTL.
  *
- * Uses INSERT OR IGNORE so that the insert is a single atomic operation:
- * exactly one concurrent request will succeed and receive `true`; every
- * other request for the same key receives `false` and must not run the
- * downstream handler.
+ * Atomic UPDATE that transitions a pending record whose lease has expired
+ * (locked_until < now) to a fresh pending record with a new lease, or inserts
+ * a new row if the key is absent or fully expired.
+ *
+ * Uses a single SQL statement so concurrent callers cannot race to grab the
+ * same expired record.
  *
  * Returns true  — this caller owns the key; proceed with the handler.
- * Returns false — another request already claimed the key; caller must wait.
+ * Returns false — another request owns the key (either still pending with
+ *                 an active lease, or complete with a valid cached response).
  */
 export async function claimIdempotencyKey(
   key: string,
   requestFingerprint?: string | null,
 ): Promise<boolean> {
   const now = Date.now();
-  const sql = `
-    INSERT INTO idempotency_keys (key, status_code, response, created_at, expires_at, status, request_fingerprint)
-    VALUES (?, 0, '', ?, ?, 'pending', ?)
+  const lockedUntil = now + IDEMPOTENCY_LEASE_MS;
+  const expiresAt = now + IDEMPOTENCY_TTL_MS;
+
+  // First try to re-claim an expired pending record. If that succeeds, we own
+  // the key. If not, fall back to a normal INSERT OR IGNORE.
+  const reclaimSql = `
+    UPDATE idempotency_keys
+    SET status_code = 0,
+        response = '',
+        status = 'pending',
+        created_at = ?,
+        locked_until = ?,
+        expires_at = ?,
+        request_fingerprint = ?
+    WHERE key = ?
+      AND status = 'pending'
+      AND (locked_until IS NULL OR locked_until < ?)
+    `;
+  const insertSql = `
+    INSERT INTO idempotency_keys (key, status_code, response, created_at, expires_at, status, locked_until, request_fingerprint)
+    VALUES (?, 0, '', ?, ?, 'pending', ?, ?)
     ON CONFLICT (key) DO NOTHING
   `;
-  const result = await timedQueryAsync(sql, () =>
-    getDriver().run(sql, [key, now, now + IDEMPOTENCY_TTL_MS, requestFingerprint ?? null])
+
+  // Attempt reclaim first (SQLite: no RETURNING, so we check changes)
+  const reclaimResult = await timedQueryAsync(reclaimSql, () =>
+    getDriver().run(reclaimSql, [now, lockedUntil, expiresAt, requestFingerprint ?? null, key, now])
   );
-  // changes === 1 means a new row was inserted (this caller won the race).
-  return result.changes === 1;
+
+  if (reclaimResult.changes === 1) {
+    return true;
+  }
+
+  // Reclaim didn't succeed; try a fresh insert
+  const insertResult = await timedQueryAsync(insertSql, () =>
+    getDriver().run(insertSql, [key, now, expiresAt, lockedUntil, requestFingerprint ?? null])
+  );
+
+  return insertResult.changes === 1;
 }
 
 /**
- * Transition a 'pending' idempotency key to 'complete', recording the final
- * response.  Called by the middleware after the handler has written its response.
+ * Transition a 'pending' idempotency key to 'complete', or delete it for
+ * transient failures.  Called by the middleware after the handler has written
+ * its response.
+ *
+ * Only persisted outcomes:
+ *   • 2xx (success)
+ *   • 4xx that are deterministic (exclude 408/409/423/429 which indicate
+ *     retryable conditions or client errors that should not be cached)
+ *
+ * Transient 5xx responses are NOT cached; the pending record is deleted so
+ * the client can retry with the same key.
  */
 export async function updateIdempotencyRecord(
   key: string,
   statusCode: number,
   body: unknown,
 ): Promise<void> {
-  const sql = `
-    UPDATE idempotency_keys
-    SET status_code = ?, response = ?, status = 'complete'
-    WHERE key = ?
-  `;
-  await timedQueryAsync(sql, () =>
-    getDriver().run(sql, [statusCode, JSON.stringify(body), key])
-  );
+  const shouldCache = isDeterministicOutcome(statusCode);
+
+  if (shouldCache) {
+    const sql = `
+      UPDATE idempotency_keys
+      SET status_code = ?, response = ?, status = 'complete'
+      WHERE key = ?
+    `;
+    await timedQueryAsync(sql, () =>
+      getDriver().run(sql, [statusCode, JSON.stringify(body), key])
+    );
+  } else {
+    // For transient failures (5xx) and retryable client errors (408/409/423/429),
+    // delete the pending record so the client can retry with the same key.
+    const sql = 'DELETE FROM idempotency_keys WHERE key = ? AND status = ?';
+    await timedQueryAsync(sql, () =>
+      getDriver().run(sql, [key, 'pending'])
+    );
+  }
+}
+
+/**
+ * Returns true when the response should be cached for idempotency replay.
+ *
+ * 2xx: always cache (successful outcomes are deterministic).
+ * 4xx: cache only if not retryable (exclude 408/409/423/429).
+ * 5xx: never cache (transient server errors should be retryable).
+ */
+function isDeterministicOutcome(statusCode: number): boolean {
+  if (statusCode >= 200 && statusCode < 300) {
+    return true;
+  }
+  if (statusCode >= 400 && statusCode < 500) {
+    // 408 (Request Timeout), 409 (Conflict), 423 (Locked), 429 (Too Many Requests)
+    // are all retryable or indicate a client action is needed; don't cache.
+    return ![408, 409, 423, 429].includes(statusCode);
+  }
+  // 5xx are transient; clients should retry.
+  return false;
 }
 
 /**
@@ -1203,12 +1499,12 @@ export async function saveIdempotencyRecord(
 ): Promise<void> {
   const now = Date.now();
   const sql = `
-    INSERT INTO idempotency_keys (key, status_code, response, created_at, expires_at, status)
-    VALUES (?, ?, ?, ?, ?, 'complete')
+    INSERT INTO idempotency_keys (key, status_code, response, created_at, expires_at, status, locked_until)
+    VALUES (?, ?, ?, ?, ?, 'complete', ?)
     ON CONFLICT(key) DO NOTHING
   `;
   await timedQueryAsync(sql, () =>
-    getDriver().run(sql, [key, statusCode, JSON.stringify(body), now, now + IDEMPOTENCY_TTL_MS])
+    getDriver().run(sql, [key, statusCode, JSON.stringify(body), now, now + IDEMPOTENCY_TTL_MS, null])
   );
 }
 
@@ -1803,6 +2099,22 @@ export interface ScoutPlayerNoteRow {
  * Uses upsert semantics: calling twice for the same (scout_wallet, player_id)
  * pair overwrites the note rather than creating a duplicate row.
  */
+function encryptScoutNoteContent(plaintext: string): string {
+  return encryptField(plaintext, { purpose: 'notes' });
+}
+
+function decryptScoutNoteContent(stored: string): string {
+  return decryptField(stored, { purpose: 'notes' });
+}
+
+function mapScoutPlayerNoteRow(row: ScoutPlayerNoteRow): ScoutPlayerNoteRow {
+  return { ...row, note_text: decryptScoutNoteContent(row.note_text) };
+}
+
+function mapScoutPlayerNoteV2Row(row: ScoutPlayerNoteV2Row): ScoutPlayerNoteV2Row {
+  return { ...row, content: decryptScoutNoteContent(row.content) };
+}
+
 export async function upsertScoutNote(p: {
   scout_wallet: string;
   player_id: string;
@@ -1816,8 +2128,9 @@ export async function upsertScoutNote(p: {
       note_text  = excluded.note_text,
       updated_at = excluded.updated_at
   `;
+  const encryptedNote = encryptScoutNoteContent(p.note_text);
   await timedQueryAsync(sql, () =>
-    getDriver().run(sql, [p.scout_wallet, p.player_id, p.note_text, p.updated_at]),
+    getDriver().run(sql, [p.scout_wallet, p.player_id, encryptedNote, p.updated_at]),
   );
 }
 
@@ -1831,9 +2144,10 @@ export async function getScoutNote(
 ): Promise<ScoutPlayerNoteRow | null> {
   const sql =
     'SELECT * FROM scout_player_notes WHERE scout_wallet = ? AND player_id = ? LIMIT 1';
-  return timedQueryAsync(sql, async () =>
-    (await getDriver().get<ScoutPlayerNoteRow>(sql, [scoutWallet, playerId])) ?? null,
-  );
+  return timedQueryAsync(sql, async () => {
+    const row = await getDriver().get<ScoutPlayerNoteRow>(sql, [scoutWallet, playerId]);
+    return row ? mapScoutPlayerNoteRow(row) : null;
+  });
 }
 
 /**
@@ -1842,9 +2156,10 @@ export async function getScoutNote(
 export async function getScoutNotes(scoutWallet: string): Promise<ScoutPlayerNoteRow[]> {
   const sql =
     'SELECT * FROM scout_player_notes WHERE scout_wallet = ? ORDER BY updated_at DESC';
-  return timedQueryAsync(sql, () =>
-    getDriver().all<ScoutPlayerNoteRow>(sql, [scoutWallet]),
-  );
+  return timedQueryAsync(sql, async () => {
+    const rows = await getDriver().all<ScoutPlayerNoteRow>(sql, [scoutWallet]);
+    return rows.map(mapScoutPlayerNoteRow);
+  });
 }
 
 // ─── Scout player notes v2 helpers (multi-note CRUD) ─────────────────────────
@@ -1874,8 +2189,15 @@ export async function insertScoutPlayerNote(p: {
     VALUES (?, ?, ?, ?, ?)
     RETURNING id
   `;
+  const encryptedContent = encryptScoutNoteContent(p.content);
   return timedQueryAsync(sql, async () => {
-    const info = await getDriver().run(sql, [p.scout_wallet, p.player_id, p.content, p.created_at, p.updated_at]);
+    const info = await getDriver().run(sql, [
+      p.scout_wallet,
+      p.player_id,
+      encryptedContent,
+      p.created_at,
+      p.updated_at,
+    ]);
     return info.lastId;
   });
 }
@@ -1892,9 +2214,10 @@ export async function getScoutPlayerNotes(
     WHERE scout_wallet = ? AND player_id = ?
     ORDER BY created_at DESC
   `;
-  return timedQueryAsync(sql, () =>
-    getDriver().all<ScoutPlayerNoteV2Row>(sql, [scoutWallet, playerId]),
-  );
+  return timedQueryAsync(sql, async () => {
+    const rows = await getDriver().all<ScoutPlayerNoteV2Row>(sql, [scoutWallet, playerId]);
+    return rows.map(mapScoutPlayerNoteV2Row);
+  });
 }
 
 /**
@@ -1913,8 +2236,9 @@ export async function updateScoutPlayerNote(p: {
     SET content = ?, updated_at = ?
     WHERE id = ? AND scout_wallet = ?
   `;
+  const encryptedContent = encryptScoutNoteContent(p.content);
   return timedQueryAsync(sql, async () => {
-    const info = await getDriver().run(sql, [p.content, p.updated_at, p.id, p.scout_wallet]);
+    const info = await getDriver().run(sql, [encryptedContent, p.updated_at, p.id, p.scout_wallet]);
     return info.changes > 0;
   });
 }
@@ -2003,16 +2327,27 @@ export async function insertApiKey(p: {
     RETURNING id
   `;
   return timedQueryAsync(sql, async () => {
-    const info = await getDriver().run(sql, [
-      p.key_hash,
-      p.scout_wallet,
-      p.label,
-      p.created_at,
-      p.scopes ? JSON.stringify(p.scopes) : null,
-      p.lookup_hash ?? null,
-      p.expires_at ?? null,
-    ]);
-    return info.lastId;
+    return getDriver().transaction(async (tx) => {
+      await tx.lockForWrite(`api-key-limit:${p.scout_wallet}`);
+      const count = await tx.value<number | string>(
+        'SELECT COUNT(*) FROM api_keys WHERE scout_wallet = ?',
+        [p.scout_wallet],
+      );
+      if (Number(count ?? 0) >= MAX_API_KEYS_PER_SCOUT) {
+        throw new ApiKeyLimitError();
+      }
+
+      const info = await tx.run(sql, [
+        p.key_hash,
+        p.scout_wallet,
+        p.label,
+        p.created_at,
+        p.scopes ? JSON.stringify(p.scopes) : null,
+        p.lookup_hash ?? null,
+        p.expires_at ?? null,
+      ]);
+      return info.lastId;
+    });
   });
 }
 
@@ -2709,80 +3044,21 @@ function normalizeFeatureFlags(rows: FeatureFlagRow[]): FeatureFlagRow[] {
 
 // ─── Multi-admin action helpers ───────────────────────────────────────────────
 
-export interface PendingAdminActionRow {
-  id: string;
-  action_type: string;
-  proposer: string;
-  payload: string;
-  required_signatures: number;
-  collected_signatures: number;
-  status: string;
-  expires_at: number;
-  created_at: number;
-}
-
-export async function insertPendingAdminAction(p: {
-  id: string;
-  action_type: string;
-  proposer: string;
-  payload: string;
-  required_signatures: number;
-  expires_at: number;
-  created_at: number;
-}): Promise<void> {
-  const sql = `INSERT INTO pending_admin_actions (id, action_type, proposer, payload, required_signatures, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`;
-  await timedQueryAsync(sql, () => getDriver().run(sql, [p.id, p.action_type, p.proposer, p.payload, p.required_signatures, p.expires_at, p.created_at]));
-}
-
-export async function getPendingAdminActionById(id: string): Promise<PendingAdminActionRow | null> {
-  const sql = `SELECT * FROM pending_admin_actions WHERE id = ?`;
-  return timedQueryAsync(sql, async () =>
-    (await getDriver().get<PendingAdminActionRow>(sql, [id])) ?? null
-  );
-}
-
-export async function getPendingAdminActionsByStatus(status: string): Promise<PendingAdminActionRow[]> {
-  const sql = `SELECT * FROM pending_admin_actions WHERE status = ? ORDER BY created_at DESC`;
-  return timedQueryAsync(sql, () => getDriver().all<PendingAdminActionRow>(sql, [status]));
-}
-
-export async function updatePendingAdminActionStatus(id: string, status: string): Promise<void> {
-  const sql = `UPDATE pending_admin_actions SET status = ? WHERE id = ?`;
-  await timedQueryAsync(sql, () => getDriver().run(sql, [status, id]));
-}
-
-export async function incrementActionSignatures(id: string): Promise<void> {
-  const sql = `UPDATE pending_admin_actions SET collected_signatures = collected_signatures + 1 WHERE id = ?`;
-  await timedQueryAsync(sql, () => getDriver().run(sql, [id]));
-}
-
-export async function expireStalePendingAdminActions(): Promise<number> {
-  const sql = `UPDATE pending_admin_actions SET status = 'expired' WHERE status = 'pending' AND expires_at <= ?`;
-  const info = await timedQueryAsync(sql, () => getDriver().run(sql, [Date.now()]));
-  return info.changes;
-}
-
-export async function insertAdminActionSignature(p: {
-  action_id: string;
-  signer: string;
-  signed_at: number;
-}): Promise<boolean> {
-  const sql = `INSERT INTO admin_action_signatures (action_id, signer, signed_at) VALUES (?, ?, ?) ON CONFLICT (action_id, signer) DO NOTHING`;
-  const info = await timedQueryAsync(sql, () => getDriver().run(sql, [p.action_id, p.signer, p.signed_at]));
-  return info.changes > 0;
-}
-
-export async function getAdminActionSignature(action_id: string, signer: string): Promise<{ signed_at: number } | null> {
-  const sql = `SELECT signed_at FROM admin_action_signatures WHERE action_id = ? AND signer = ?`;
-  return timedQueryAsync(sql, async () =>
-    (await getDriver().get<{ signed_at: number }>(sql, [action_id, signer])) ?? null
-  );
-}
-
-export async function getAdminActionSignatures(action_id: string): Promise<{ signer: string; signed_at: number }[]> {
-  const sql = `SELECT signer, signed_at FROM admin_action_signatures WHERE action_id = ? ORDER BY signed_at ASC`;
-  return timedQueryAsync(sql, () => getDriver().all<{ signer: string; signed_at: number }>(sql, [action_id]));
-}
+// ─── Multi-admin action helpers ───────────────────────────────────────────────
+// Moved to src/db/repositories/adminActions.ts (#1322). Re-exported here for
+// backward compatibility — new code should import directly from the repository.
+export {
+  PendingAdminActionRow,
+  insertPendingAdminAction,
+  getPendingAdminActionById,
+  getPendingAdminActionsByStatus,
+  updatePendingAdminActionStatus,
+  incrementActionSignatures,
+  expireStalePendingAdminActions,
+  insertAdminActionSignature,
+  getAdminActionSignature,
+  getAdminActionSignatures,
+} from './repositories/adminActions';
 
 // ─── Webhook subscriptions (#470) ────────────────────────────────────────────
 //
@@ -2813,15 +3089,27 @@ export function createWebhookSubscription(
   const eventTypesJson = eventTypes && eventTypes.length > 0 ? JSON.stringify(eventTypes) : null;
   const sql = 'INSERT INTO webhook_subscriptions (url, secret, scout_wallet, event_types) VALUES (?, ?, ?, ?)';
   return timedQuery(sql, () => {
-    const info = getDb().prepare(sql).run(url, encryptedSecret, scoutWallet ?? null, eventTypesJson);
-    return {
-      id: Number(info.lastInsertRowid),
-      url,
-      secret: finalSecret,
-      scout_wallet: scoutWallet ?? null,
-      event_types: eventTypesJson,
-      created_at: new Date().toISOString(),
-    };
+    const insert = getDb().transaction(() => {
+      if (scoutWallet) {
+        const row = getDb()
+          .prepare('SELECT COUNT(*) AS count FROM webhook_subscriptions WHERE scout_wallet = ?')
+          .get(scoutWallet) as { count: number } | undefined;
+        if ((row?.count ?? 0) >= MAX_WEBHOOK_SUBSCRIPTIONS_PER_SCOUT) {
+          throw new WebhookSubscriptionLimitError();
+        }
+      }
+
+      const info = getDb().prepare(sql).run(url, encryptedSecret, scoutWallet ?? null, eventTypesJson);
+      return {
+        id: Number(info.lastInsertRowid),
+        url,
+        secret: finalSecret,
+        scout_wallet: scoutWallet ?? null,
+        event_types: eventTypesJson,
+        created_at: new Date().toISOString(),
+      };
+    });
+    return insert();
   });
 }
 
@@ -3065,80 +3353,17 @@ export function purgeOldWebhookDeadLetters(cutoffDays: number): number {
 }
 
 // ─── Fee withdrawal helpers (#fee-withdrawal) ────────────────────────────────
-
-export interface FeeWithdrawalRow {
-  id: number;
-  idempotency_key: string | null;
-  treasury_address: string;
-  amount_stroops: string;
-  tx_hash: string;
-  admin_wallet: string;
-  created_at: string;
-}
-
-/**
- * Insert a confirmed fee withdrawal record.
- * The UNIQUE constraint on `tx_hash` prevents duplicate rows for the same
- * on-chain transaction; the UNIQUE constraint on `idempotency_key` provides
- * a storage-layer guard against double-submission at the DB level (the HTTP
- * idempotency middleware is the primary gate, but belts-and-suspenders here
- * is valuable for audit integrity).
- *
- * Returns the new row id.
- */
-export async function insertFeeWithdrawal(p: {
-  idempotencyKey: string | null;
-  treasuryAddress: string;
-  amountStroops: string;
-  txHash: string;
-  adminWallet: string;
-  createdAt: string;
-}): Promise<number> {
-  const sql = `
-    INSERT INTO fee_withdrawals
-      (idempotency_key, treasury_address, amount_stroops, tx_hash, admin_wallet, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-    RETURNING id
-  `;
-  return timedQueryAsync(sql, async () => {
-    const info = await getDriver().run(sql, [
-      p.idempotencyKey ?? null,
-      p.treasuryAddress,
-      p.amountStroops,
-      p.txHash,
-      p.adminWallet,
-      p.createdAt,
-    ]);
-    return info.lastId;
-  });
-}
-
-/**
- * Look up a fee withdrawal by idempotency key.
- * Returns null when no record exists for the given key, so callers can
- * distinguish "never submitted" from "already submitted".
- */
-export async function getFeeWithdrawalByIdempotencyKey(key: string): Promise<FeeWithdrawalRow | null> {
-  const sql = `SELECT * FROM fee_withdrawals WHERE idempotency_key = ? LIMIT 1`;
-  return timedQueryAsync(sql, async () =>
-    (await getDriver().get<FeeWithdrawalRow>(sql, [key])) ?? null,
-  );
-}
-
-/**
- * Return the most recent fee_withdrawals rows, newest-first.
- * Used by GET /api/admin/fees to show withdrawal history.
- */
-export async function listFeeWithdrawals(limit = 50, offset = 0): Promise<FeeWithdrawalRow[]> {
-  const sql = `
-    SELECT * FROM fee_withdrawals
-    ORDER BY created_at DESC
-    LIMIT ? OFFSET ?
-  `;
-  return timedQueryAsync(sql, () =>
-    getDriver().all<FeeWithdrawalRow>(sql, [limit, offset]),
-  );
-}
+// Moved to src/db/repositories/feeWithdrawals.ts (#1322). Re-exported here for
+// backward compatibility — new code should import directly from the repository.
+export {
+  FeeWithdrawalRow,
+  insertFeeWithdrawal,
+  getFeeWithdrawalByIdempotencyKey,
+  listFeeWithdrawals,
+  AdminFeeConfigLogRow,
+  insertAdminFeeConfigLog,
+  listAdminFeeConfigLog,
+} from './repositories/feeWithdrawals';
 
 // ─── Webhook delivery history (#1121) ─────────────────────────────────────────
 

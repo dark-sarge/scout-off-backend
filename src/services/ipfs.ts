@@ -1,10 +1,9 @@
 // IPFS service via Pinata.
 //
 // When PINATA_API_KEY and PINATA_SECRET are not set:
-//   - In non-production environments the service starts normally and pin operations
-//     return deterministic stub values, logging a warning on each call.
-//   - In production (NODE_ENV=production) pin operations throw immediately with a
-//     clear error so misconfiguration is caught at call time rather than silently.
+//   - In development/test, pin operations return deterministic stub values.
+//   - In staging/production, pin operations throw immediately so deployments
+//     cannot persist fake CIDs as real IPFS content.
 //
 // IPFS failure handling (#346):
 //   - Failures emit a CRITICAL log entry.
@@ -49,6 +48,7 @@ import { trace, SpanStatusCode } from '@opentelemetry/api';
 import config from '../config';
 import { logger } from '../utils/logger';
 import { CircuitBreaker, CircuitBreakerOpenError } from '../utils/circuitBreaker';
+import { getRequestSignal } from '../utils/requestContext';
 import {
   insertPendingPin,
   getPendingPins,
@@ -84,14 +84,19 @@ export const ipfsBreaker = new CircuitBreaker({
 
 export { CircuitBreakerOpenError };
 
-function isPinataConfigured(): boolean {
+export function isPinataConfigured(): boolean {
   return !!(config.pinata.apiKey && config.pinata.secret);
 }
 
 function assertPinataConfigured(): void {
   throw new Error(
-    'IPFS service unavailable: PINATA_API_KEY and PINATA_SECRET must be set in production'
+    'IPFS service unavailable: PINATA_API_KEY and PINATA_SECRET must be set in staging and production'
   );
+}
+
+function allowLocalPinStubs(): boolean {
+  const nodeEnv = process.env.NODE_ENV ?? config.nodeEnv;
+  return nodeEnv === 'development' || nodeEnv === 'test';
 }
 
 function pinataHeaders() {
@@ -192,8 +197,8 @@ export async function pinJson(body: object): Promise<string> {
       }
 
       if (!isPinataConfigured()) {
-        if (process.env.NODE_ENV === 'production') assertPinataConfigured();
-        logger.warn('[ipfs] Pinata not configured — returning dev stub CID for pinJson');
+        if (!allowLocalPinStubs()) assertPinataConfigured();
+        logger.warn('[ipfs] Pinata not configured — returning local stub CID for pinJson');
         return devStubCid(JSON.stringify(body));
       }
 
@@ -259,7 +264,11 @@ export async function pinJson(body: object): Promise<string> {
 
           try {
             const res = await ipfsBreaker.execute(() =>
-              axios.post(PINATA_PIN_JSON_URL, body, { headers: pinataHeaders(), ...axiosTimeout }),
+              axios.post(PINATA_PIN_JSON_URL, body, {
+                headers: pinataHeaders(),
+                ...axiosTimeout,
+                signal: getRequestSignal(),
+              }),
             );
             const uploadedCid = res.data.IpfsHash as string;
             // Persist the CID into the pending_pins row BEFORE deleting it so any
@@ -299,8 +308,8 @@ export async function pinFile(buffer: Buffer, filename: string, mimeType: string
   const span = tracer.startSpan('ipfs.pinFile', { attributes: { 'ipfs.filename': filename, 'ipfs.mime_type': mimeType } });
   try {
     if (!isPinataConfigured()) {
-      if (process.env.NODE_ENV === 'production') assertPinataConfigured();
-      logger.warn('[ipfs] Pinata not configured — returning dev stub CID for pinFile');
+      if (!allowLocalPinStubs()) assertPinataConfigured();
+      logger.warn('[ipfs] Pinata not configured — returning local stub CID for pinFile');
       return devStubCid(filename);
     }
     const form = new FormData();
@@ -310,6 +319,7 @@ export async function pinFile(buffer: Buffer, filename: string, mimeType: string
         headers: { ...pinataHeaders(), ...form.getHeaders() },
         maxBodyLength: Infinity,
         ...axiosTimeout,
+        signal: getRequestSignal(),
       }),
     );
     const cid = res.data.IpfsHash as string;
@@ -342,8 +352,8 @@ export async function getCid(uriOrCid: string): Promise<string> {
 
 /**
  * Health check for the Pinata/IPFS dependency.
- * Resolves immediately (with a warning) when credentials are absent in non-production.
- * Rejects with a clear error in production without credentials.
+ * Resolves immediately (with a warning) when credentials are absent in development/test.
+ * Rejects with a clear error in staging/production without credentials.
  * Also reports breaker state — if open, reports unavailable immediately.
  */
 export async function checkHealth(): Promise<void> {
@@ -353,8 +363,8 @@ export async function checkHealth(): Promise<void> {
       throw new Error('IPFS circuit breaker is open — Pinata unavailable');
     }
     if (!isPinataConfigured()) {
-      if (process.env.NODE_ENV === 'production') assertPinataConfigured();
-      logger.warn('[ipfs] Pinata not configured — skipping IPFS health check in dev');
+      if (!allowLocalPinStubs()) assertPinataConfigured();
+      logger.warn('[ipfs] Pinata not configured — skipping IPFS health check locally');
       return;
     }
     await ipfsBreaker.execute(() =>
@@ -375,7 +385,10 @@ const DEBOUNCE_MS = 60 * 1000; // 1 minute
  * Rows exceeding MAX_RETRIES are skipped and considered permanently failed.
  */
 export async function retryPendingPins(): Promise<void> {
-  if (!isPinataConfigured()) return;
+  if (!isPinataConfigured()) {
+    if (!allowLocalPinStubs()) assertPinataConfigured();
+    return;
+  }
   const pending = await getPendingPins();
   const now = Date.now();
 

@@ -38,6 +38,8 @@ import { playerIdSchema } from "../utils/playerIdValidator";
 import { recordAudit } from "../utils/audit";
 import { canAccessPlayer } from "../utils/playerAccess";
 import { MAX_PAGE_SIZE, DEFAULT_PAGE_SIZE } from "../utils/pagination";
+import { logger } from "../utils/logger";
+import config from "../config";
 
 const baseRegistrationSchema = z.object({
   wallet: z.string().min(56).max(56),
@@ -105,15 +107,13 @@ export async function registerPlayer(
           ...parsed.metadata,
         });
 
-  // Invalidate player search cache so new profile appears in results
-  await invalidatePlayerCache();
-
   // Write to DB immediately so GET /players/:playerId returns 200 without
   // waiting for the indexer to process the blockchain event (#282).
   const playerId = createId();
   const now = Date.now();
   await insertOrUpdatePlayer({
     player_id: playerId,
+    on_chain_player_id: null,
     wallet: parsed.wallet,
     position: canonicalPosition,
     region: sanitizedRegion,
@@ -122,12 +122,24 @@ export async function registerPlayer(
     registered_at: now,
   });
 
-  await dispatchEventWebhook("player_registered", {
+  // Invalidate after the write so a concurrent list request cannot repopulate
+  // the cache with a stale result between invalidation and insertion.
+  await invalidatePlayerCache();
+
+  void dispatchEventWebhook("player_registered", {
     player_id: playerId,
+    on_chain_player_id: null,
+    registration_status: 'pending',
     wallet: parsed.wallet,
     position: canonicalPosition,
     region: sanitizedRegion,
     metadataUri,
+  }).catch((err: unknown) => {
+    logger.warn(
+      `[players] registration webhook failed player=${playerId}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
   });
 
   const ipfsResult = serializeIpfsResult(metadataUri, {
@@ -136,10 +148,38 @@ export async function registerPlayer(
     region: sanitizedRegion,
   });
   const body: ApiResponse<
-    typeof ipfsResult & { playerId: string; metadataUri: string; gatewayUrl: string }
+    typeof ipfsResult & {
+      playerId: string;
+      metadataUri: string;
+      gatewayUrl: string;
+      onChainPlayerId: null;
+      registrationStatus: 'pending';
+      onChainRegistration: {
+        contractId: string;
+        method: 'register_player';
+        args: { wallet: string; metadataUri: string; position: string; region: string };
+      };
+    }
   > = {
     success: true,
-    data: { ...ipfsResult, playerId, metadataUri, gatewayUrl: ipfsResult.uri },
+    data: {
+      ...ipfsResult,
+      playerId,
+      metadataUri,
+      gatewayUrl: ipfsResult.uri,
+      onChainPlayerId: null,
+      registrationStatus: 'pending',
+      onChainRegistration: {
+        contractId: config.registerContractId,
+        method: 'register_player',
+        args: {
+          wallet: parsed.wallet,
+          metadataUri,
+          position: canonicalPosition,
+          region: sanitizedRegion,
+        },
+      },
+    },
   };
   res.status(201).json(body);
  } catch (err) {
@@ -157,6 +197,8 @@ function buildPlayerDetail(row: PlayerRow): Record<string, unknown> {
   const { tierName: tierNameMeta, tierDescription } = getTierMeta(row.progress_level as number);
   return {
     player_id: row.player_id,
+    on_chain_player_id: row.on_chain_player_id,
+    registration_status: row.on_chain_player_id ? 'registered' : 'pending',
     wallet: row.wallet,
     position: row.position,
     region: row.region,
@@ -584,20 +626,17 @@ export async function getPlayerMilestones(
   const includeRejected = status === "rejected";
 
   const approvedEvents = includeApproved
-    ? queryEvents("milestone_approved")
-        .filter((e) => e.payload.player_id === playerId)
+    ? queryEvents("milestone_approved", { payloadFilter: { player_id: playerId } })
         .map((e) => ({ ...e.payload, status: "approved" as const }))
     : [];
 
   const pendingEvents = includePending
-    ? queryEvents("milestone_submitted")
-        .filter((e) => e.payload.player_id === playerId)
+    ? queryEvents("milestone_submitted", { payloadFilter: { player_id: playerId } })
         .map((e) => ({ ...e.payload, status: "pending" as const }))
     : [];
 
   const rejectedEvents = includeRejected
-    ? queryEvents("milestone_rejected")
-        .filter((e) => e.payload.player_id === playerId)
+    ? queryEvents("milestone_rejected", { payloadFilter: { player_id: playerId } })
         .map((e) => ({ ...e.payload, status: "rejected" as const }))
     : [];
 

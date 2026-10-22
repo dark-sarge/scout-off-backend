@@ -25,6 +25,7 @@ import { signWebhookPayload } from '../services/webhooks';
 import { sendForbidden } from '../utils/authError';
 import { logger } from '../utils/logger';
 import type { ContractEventType } from '../types';
+import { WebhookSubscriptionLimitError } from '../utils/scoutResourceLimits';
 
 // ─── Known event types ────────────────────────────────────────────────────────
 
@@ -91,6 +92,7 @@ function serializeSubscription(
  * @response 201 { success: true, data: { id, url, secret, eventTypes, createdAt } }
  * @response 400 Invalid URL or unknown event type
  * @response 403 Wallet mismatch
+ * @response 409 Scout webhook subscription limit reached
  * @auth Bearer (scout role required; wallet must match authenticated account)
  */
 export async function registerWebhook(
@@ -108,12 +110,21 @@ export async function registerWebhook(
   }
 
   const { url, eventTypes } = parsed.data;
-  const subscription = createWebhookSubscription(
-    url,
-    undefined, // auto-generate secret
-    req.params.wallet as string,
-    eventTypes,
-  );
+  let subscription: ReturnType<typeof createWebhookSubscription>;
+  try {
+    subscription = createWebhookSubscription(
+      url,
+      undefined, // auto-generate secret
+      req.params.wallet as string,
+      eventTypes,
+    );
+  } catch (err) {
+    if (err instanceof WebhookSubscriptionLimitError) {
+      res.status(409).json({ success: false, error: err.message });
+      return;
+    }
+    throw err;
+  }
 
   logger.info({
     scout: req.params.wallet as string,
@@ -233,7 +244,8 @@ try {
     const payload = { event: 'test', timestamp: new Date().toISOString() };
     const rawBody = JSON.stringify(payload);
     const plainSecret = decryptWebhookSecret(row.secret);
-    const signature = signWebhookPayload(rawBody, plainSecret);
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const signature = signWebhookPayload(rawBody, plainSecret, timestamp);
 
     try {
       const response = await fetch(row.url, {
@@ -241,6 +253,7 @@ try {
         body: rawBody,
         headers: {
           'Content-Type': 'application/json',
+          'X-Webhook-Timestamp': timestamp,
           'X-Webhook-Signature': signature,
         },
       });

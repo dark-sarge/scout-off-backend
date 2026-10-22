@@ -368,17 +368,18 @@ describe('POST /api/scouts/:wallet/players/:playerId/notes', () => {
     expect(mockInsertScoutPlayerNote).toHaveBeenCalledTimes(1);
   });
 
-  it('sanitizes HTML before storing', async () => {
+  // Since #1319 note text is normalized and stored verbatim; HTML escaping is
+  // applied at render time (escapeHtml), not on input.
+  it('normalizes content before storing without HTML-encoding it', async () => {
     mockInsertScoutPlayerNote.mockReturnValueOnce(1);
 
     const res = await request(app)
       .post(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes`)
       .set('Authorization', `Bearer ${scoutAToken}`)
-      .send({ content: '<script>alert(1)</script>Follow up' });
+      .send({ content: '  <script>alert(1)</script>Follow up\n' });
 
     expect(res.status).toBe(201);
-    expect(res.body.data.content).not.toContain('<script>');
-    expect(res.body.data.content).not.toContain('</script>');
+    expect(res.body.data.content).toBe('<script>alert(1)</script>Follow up');
   });
 
   it('strips control characters before storing', async () => {
@@ -553,16 +554,16 @@ describe('PUT /api/scouts/:wallet/players/:playerId/notes/:noteId', () => {
     );
   });
 
-  it('sanitizes content before storing', async () => {
+  it('normalizes content before storing without HTML-encoding it', async () => {
     mockUpdateScoutPlayerNote.mockReturnValueOnce(true);
 
     const res = await request(app)
       .put(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes/1`)
       .set('Authorization', `Bearer ${scoutAToken}`)
-      .send({ content: '<b>Bold claim</b>' });
+      .send({ content: '<b>Bold\x00 claim</b>' });
 
     expect(res.status).toBe(200);
-    expect(res.body.data.content).not.toContain('<b>');
+    expect(res.body.data.content).toBe('<b>Bold claim</b>');
   });
 
   it('returns 404 when the note does not exist or belongs to another scout', async () => {

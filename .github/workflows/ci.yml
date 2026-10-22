@@ -79,6 +79,12 @@ jobs:
       - name: Validate OpenAPI spec is in sync with route sources
         run: npm run validate:openapi
 
+      - name: Validate generated TypeScript client
+        run: npm run validate:client
+
+      - name: Type check generated TypeScript client
+        run: npm run typecheck:client
+
       - name: Check for unsafe SQL string interpolation
         run: npm run check:sql-injection
 
@@ -137,9 +143,7 @@ jobs:
   # SQLite-specific APIs, or that assume synchronous DB writes / re-init the
   # module registry with jest.resetModules() (which strips the awaited
   # initDb() the Postgres driver needs) — see docs/postgres-migration.md FAQ.
-  # Keep this list aligned with package.json `test:postgres`. adminPagination
-  # is included (fully mocked). playerListFreshness and trialOffers remain
-  # excluded.
+  # Keep exclusions aligned with tests/postgres-exclusions.json (via npm run test:postgres).
   postgres:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -173,40 +177,43 @@ jobs:
         run: node node_modules/.bin/tsc --noEmit
 
       - name: Run test suite against DB_DRIVER=postgres
-        run: >
-          node node_modules/jest/bin/jest.js --runInBand
-          --testPathIgnorePatterns="/node_modules/"
-          --testPathIgnorePatterns="tests/controllers/webhookAdminController.test.ts"
-          --testPathIgnorePatterns="tests/db/backfill.test.ts"
-          --testPathIgnorePatterns="tests/db/sqlInjectionRegression.test.ts"
-          --testPathIgnorePatterns="tests/e2e/milestonePromotion.e2e.test.ts"
-          --testPathIgnorePatterns="tests/e2e/scoutUnlock.e2e.test.ts"
-          --testPathIgnorePatterns="tests/routes/adminAuditTrail.test.ts"
-          --testPathIgnorePatterns="tests/routes/adminExport.test.ts"
-          --testPathIgnorePatterns="tests/routes/adminQuerySchema.test.ts"
-          --testPathIgnorePatterns="tests/routes/exportStreaming.test.ts"
-          --testPathIgnorePatterns="tests/routes/reindex.test.ts"
-          --testPathIgnorePatterns="tests/routes/playerListFreshness.test.ts"
-          --testPathIgnorePatterns="tests/routes/trialOffers.test.ts"
-          --testPathIgnorePatterns="tests/services/indexer.test.ts"
-          --testPathIgnorePatterns="tests/services/indexerDispatch.test.ts"
-          --testPathIgnorePatterns="tests/services/tierPromotion.test.ts"
-          --testPathIgnorePatterns="tests/services/webhooks.test.ts"
-          --testPathIgnorePatterns="tests/routes/cors.test.ts"
-          --testPathIgnorePatterns="tests/routes/replay.test.ts"
-          --testPathIgnorePatterns="tests/routes/webhookDeliveries.test.ts"
-          --testPathIgnorePatterns="tests/services/replayService.test.ts"
-          --testPathIgnorePatterns="tests/services/adminMultiSigExecution.test.ts"
-          --testPathIgnorePatterns="tests/db/apiKeyLookup.test.ts"
-          --testPathIgnorePatterns="tests/services/reindexService.test.ts"
-          --testPathIgnorePatterns="tests/db/apiKeyRotation.test.ts"
-          --testPathIgnorePatterns="tests/services/reindexCatchupMode.test.ts"
-          --testPathIgnorePatterns="tests/services/txCorrelation.test.ts"
+        run: npm run test:postgres
         env:
           DB_DRIVER: postgres
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/scout_off_ci
           POSTGRES_TEST_URL: postgres://postgres:postgres@localhost:5432/scout_off_ci
           CONTRACT_ID: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4
+
+  redis-integration:
+    name: Redis integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run integration tests against Redis
+        run: node node_modules/jest/bin/jest.js --runInBand --forceExit --runTestsByPath tests/services/redis.integration.test.ts
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
 
   # Catches "compiles but doesn't run" regressions (bad import path, missing
   # runtime asset like db/ migrations or openapi files) that tsc alone can't
@@ -289,12 +296,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build Docker image with GIT_COMMIT build arg
+      - name: Build Docker image with OCI build args
         run: |
+          BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          VERSION=$(node -p "require('./package.json').version")
           docker build \
             --build-arg GIT_COMMIT=${{ github.sha }} \
+            --build-arg VERSION="${VERSION}" \
+            --build-arg BUILD_DATE="${BUILD_DATE}" \
             --tag scout-off-backend:ci \
             .
+
+      - name: Scan Docker image for vulnerabilities
+        # Pinned by commit SHA (v0.36.0): upstream retagged its releases with a
+        # `v` prefix, so the old `0.30.0` ref no longer resolves, and a SHA
+        # cannot be silently re-pointed the way a tag can.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: scout-off-backend:ci
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
 
       - name: Verify GIT_COMMIT is set in the image
         run: |
@@ -305,6 +329,77 @@ jobs:
             node -e "console.log(process.env.GIT_COMMIT)")
           echo "GIT_COMMIT in image: $commit"
           test "$commit" = "${{ github.sha }}"
+
+      - name: Docker smoke test - verify app boots and health endpoints work
+        run: |
+          # Run the container with test env vars, binding port 4000
+          docker run --rm -d \
+            --name scout-off-ci \
+            -p 4000:4000 \
+            -e NODE_ENV=test \
+            -e PORT=4000 \
+            -e DB_PATH=/data/scout-off.db \
+            -e CONTRACT_ID=CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4 \
+            -e JWT_SECRET=test-secret-min-32-chars-for-ci-only \
+            scout-off-backend:ci
+          
+          # Wait for the app to become healthy
+          attempt=0
+          max_attempts=30
+          while [ $attempt -lt $max_attempts ]; do
+            status=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:4000/health/liveness 2>/dev/null || echo "000")
+            if [ "$status" = "200" ]; then
+              echo "✓ /health/liveness returned 200 after ${attempt}s"
+              break
+            fi
+            if [ $attempt -eq $((max_attempts - 1)) ]; then
+              echo "✗ Server failed to become healthy within ${max_attempts}s"
+              docker logs scout-off-ci
+              docker stop scout-off-ci || true
+              exit 1
+            fi
+            sleep 1
+            attempt=$((attempt + 1))
+          done
+
+          # Test health endpoints
+          for endpoint in "/health/liveness" "/health/readiness"; do
+            status=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:4000${endpoint}")
+            if [ "$status" != "200" ]; then
+              echo "✗ ${endpoint} returned ${status}, expected 200"
+              docker logs scout-off-ci
+              docker stop scout-off-ci || true
+              exit 1
+            fi
+            echo "✓ ${endpoint} returned 200"
+          done
+
+          # Test a DB-backed endpoint by creating a test player and checking it
+          # The /api/players endpoint should work if DB is initialized
+          status=$(curl -s -o /dev/null -w '%{http_code}' -X GET "http://localhost:4000/api/players" \
+            -H "Authorization: Bearer test-token" 2>/dev/null || echo "000")
+          if [ "$status" = "401" ] || [ "$status" = "200" ]; then
+            # 401 = auth failed but endpoint exists and tried to check auth (good)
+            # 200 = endpoint fully worked (also good)
+            echo "✓ DB-backed endpoint /api/players responded with HTTP $status (DB accessible)"
+          else
+            echo "✗ /api/players returned ${status}, expected 401 or 200"
+            docker logs scout-off-ci
+            docker stop scout-off-ci || true
+            exit 1
+          fi
+
+          # Get image size for regression detection
+          image_size=$(docker images --no-trunc --quiet scout-off-backend:ci | xargs docker inspect -f '{{.Size}}')
+          image_size_mb=$((image_size / 1024 / 1024))
+          echo "Docker image size: ${image_size_mb}MB"
+          
+          docker stop scout-off-ci
+          
+          # Fail if image grew by >10% from a baseline (this is a soft check; adjust as needed)
+          # For now just report it; future PRs can establish a baseline
+          echo "::notice::Docker image: ${image_size_mb}MB (check regression vs prior builds)"
+
   contracts:
     name: Soroban Contracts
     runs-on: ubuntu-latest
@@ -316,7 +411,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.81.0
           targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
@@ -331,6 +428,17 @@ jobs:
       - name: Build contracts (WASM)
         working-directory: contracts
         run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: Check formatting
+        working-directory: contracts
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        working-directory: contracts
+        run: cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+
+      - name: Report optimized WASM sizes
+        run: bash scripts/report-contract-wasm-size.sh
 
       # contracts/.cargo/config.toml sets wasm32-unknown-unknown as the
       # default build target for this workspace, so host-target commands

@@ -8,7 +8,6 @@ import {
   Account,
   Transaction,
 } from '@stellar/stellar-sdk';
-import jwt from 'jsonwebtoken';
 import { trace, SpanStatusCode } from '@opentelemetry/api';
 import config from '../config';
 
@@ -46,11 +45,11 @@ function resolveServerKeypair(): Keypair {
 
 const SERVER_KEYPAIR = resolveServerKeypair();
 const CHALLENGE_TTL_SECONDS = 300; // 5 min to sign the challenge
-const TOKEN_TTL_SECONDS = 86400;   // 24 h JWT validity
+const TIME_GRACE_WINDOW_SECONDS = 60; // Allow minTime to be up to 60 seconds in the future
 
 /**
  * Tracks nonces (the base64-encoded manageData value) of SEP-10 challenges
- * that have already been redeemed for a token, so a captured signed
+ * that have already been redeemed, so a captured signed
  * challenge can't be replayed against POST /auth/token for as long as its
  * TTL window remains valid (#693).
  *
@@ -79,23 +78,42 @@ export function getServerKeypair(): Keypair {
 /**
  * Build a SEP-10 challenge transaction.
  * The client must sign it with their Stellar keypair and return the XDR.
+ *
+ * Optionally includes the web_auth_domain operation if WEB_AUTH_DOMAIN is configured.
+ * Per SEP-10, the first operation must be manageData with name 'scoutoff auth',
+ * and any additional operations (like web_auth_domain) must be sourced by the server.
  */
 export function buildChallenge(accountId: string): string {
   const span = tracer.startSpan('sep10.buildChallenge', { attributes: { 'sep10.account': accountId } });
   try {
   const serverAccount = new Account(SERVER_KEYPAIR.publicKey(), '-1');
-  const tx = new TransactionBuilder(serverAccount, {
+  const txBuilder = new TransactionBuilder(serverAccount, {
     fee: BASE_FEE,
-    networkPassphrase:
-      config.network === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET,
-  })
-    .addOperation(
+    networkPassphrase: config.networkPassphrase,
+  });
+
+  // Add the mandatory first operation: manageData with 'scoutoff auth'
+  txBuilder.addOperation(
+    Operation.manageData({
+      name: 'scoutoff auth',
+      value: crypto.randomBytes(48).toString('base64'),
+      source: accountId,
+    })
+  );
+
+  // Optionally add web_auth_domain operation if configured
+  // This is per SEP-10 optional requirement for web authentication domains
+  if (config.webAuthDomain) {
+    txBuilder.addOperation(
       Operation.manageData({
-        name: 'scoutoff auth',
-        value: crypto.randomBytes(48).toString('base64'),
-        source: accountId,
+        name: 'web_auth_domain',
+        value: Buffer.from(config.webAuthDomain),
+        source: SERVER_KEYPAIR.publicKey(), // Server-sourced per SEP-10
       })
-    )
+    );
+  }
+
+  const tx = txBuilder
     .setTimeout(CHALLENGE_TTL_SECONDS)
     .build();
 
@@ -123,9 +141,7 @@ export function buildChallenge(accountId: string): string {
  */
 export function extractAccount(xdr: string): string | null {
   try {
-    const network =
-      config.network === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET;
-    const tx = new Transaction(xdr, network);
+    const tx = new Transaction(xdr, config.networkPassphrase);
     return tx.operations[0].source ?? null;
   } catch {
     return null;
@@ -133,55 +149,82 @@ export function extractAccount(xdr: string): string | null {
 }
 
 /**
- * Verify the client-signed challenge XDR and issue a JWT.
+ * Verify the client-signed challenge XDR.
  *
  * This implements SEP-10 authentication by:
- * 1. Validating the challenge transaction structure
- * 2. Cryptographically verifying the client's signature using Keypair.verify()
- * 3. Issuing a JWT with client account and role claim
- *
- * Note: The role parameter is expected to be pre-validated by the caller.
- * Role enforcement (e.g., enum validation) is handled in the auth controller.
- * Authorized routes use requireRole() or requireRoles() middleware to enforce access.
+ * 1. Validating the challenge transaction structure per SEP-10 requirements
+ * 2. Cryptographically verifying the server and client signatures
+ * 3. Rejecting replayed challenges
  *
  * @param xdr - The signed challenge transaction in XDR format
- * @param role - Optional role claim for the JWT (defaults to 'player'). Must be validated by caller.
- * @returns JWT token and authenticated account ID
+ * @returns Authenticated account ID
  * @throws Error if challenge structure is invalid or signature verification fails
  */
-export function verifyAndIssueToken(xdr: string, role?: string): { token: string; account: string } {
-  const span = tracer.startSpan('sep10.verifyAndIssueToken');
+export function verifyChallenge(xdr: string): { account: string } {
+  const span = tracer.startSpan('sep10.verifyChallenge');
   try {
-  const network =
-    config.network === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET;
+  const tx = new Transaction(xdr, config.networkPassphrase);
 
-  const tx = new Transaction(xdr, network);
+  // 1. Verify transaction source account is the server account
+  // Per SEP-10, the challenge transaction must have the server as the source account
+  if (tx.source !== SERVER_KEYPAIR.publicKey()) {
+    throw new Error('Challenge source account is not the server account');
+  }
 
-  // Enforce challenge TTL — reject expired challenges to prevent replay attacks
-  const maxTime = Number(tx.timeBounds?.maxTime ?? 0);
-  if (maxTime > 0 && Math.floor(Date.now() / 1000) > maxTime) {
+  // 2. Verify sequence number is 0
+  // The challenge is built from sequence -1, so the built tx has sequence 0
+  if (tx.sequence !== '0') {
+    throw new Error('Challenge sequence number must be 0');
+  }
+
+  // 3. Verify time bounds are present and valid
+  // SEP-10 requires timeBounds to be present; reject missing time bounds
+  // The SDK reports bounds as strings, so an unbounded (TimeoutInfinite)
+  // challenge shows up as maxTime '0' rather than a falsy value.
+  if (!tx.timeBounds || !tx.timeBounds.minTime || !tx.timeBounds.maxTime) {
+    throw new Error('Challenge must have time bounds');
+  }
+
+  const minTime = Number(tx.timeBounds.minTime);
+  const maxTime = Number(tx.timeBounds.maxTime);
+  if (maxTime === 0) {
+    throw new Error('Challenge must have time bounds');
+  }
+  const now = Math.floor(Date.now() / 1000);
+
+  // minTime must not be in the future (with a small grace window for clock skew)
+  if (minTime > now + TIME_GRACE_WINDOW_SECONDS) {
+    throw new Error('Challenge minTime is in the future');
+  }
+
+  // maxTime must not be too far in the past (challenge expired)
+  if (maxTime > 0 && now > maxTime) {
     throw new Error('Challenge has expired');
   }
 
-  // Validate challenge transaction structure
+  // 4. Validate challenge transaction structure
   if (!tx.operations || tx.operations.length === 0) {
     throw new Error('Invalid challenge: no operations found');
   }
 
-  const op = tx.operations[0];
-
-  // 1. Verify the first operation is manageData
-  if (op.type !== 'manageData') {
-    throw new Error('Invalid challenge: expected manageData operation');
+  // 5. Verify all operations are manageData operations
+  // Per SEP-10, every operation in the challenge must be a manageData operation
+  for (let i = 0; i < tx.operations.length; i++) {
+    const op = tx.operations[i];
+    if (op.type !== 'manageData') {
+      throw new Error(`Invalid challenge: operation ${i} must be manageData`);
+    }
   }
 
-  // 2. Verify the operation name matches the expected server string
+  const op = tx.operations[0];
   const manageDataOp = op as Operation.ManageData;
+
+  // 6. Verify the operation name matches the expected server string
   if (manageDataOp.name !== 'scoutoff auth') {
     throw new Error('Invalid challenge: wrong operation name');
   }
 
-  // 3. Verify the nonce value is present and properly formatted (64 bytes)
+  // 7. Verify the nonce value is present and properly formatted (64 bytes)
   if (!manageDataOp.value) {
     throw new Error('Invalid challenge: missing nonce value');
   }
@@ -191,13 +234,13 @@ export function verifyAndIssueToken(xdr: string, role?: string): { token: string
     throw new Error('Invalid challenge: nonce must be exactly 64 bytes');
   }
 
-  // 4. Verify the operation's source is the client account
+  // 8. Verify the first operation's source is the client account
   const clientAccountId = manageDataOp.source;
   if (!clientAccountId) {
     throw new Error('Missing source account in challenge');
   }
 
-  // 5. Verify the server signed the challenge (proves it was built by this server)
+  // 9. Verify the server signed the challenge (proves it was built by this server)
   // Per SEP-10, the challenge must originate from the server keypair
   const serverSigned = tx.signatures.some((sig) => {
     try {
@@ -213,7 +256,18 @@ export function verifyAndIssueToken(xdr: string, role?: string): { token: string
   });
   if (!serverSigned) throw new Error('Challenge not signed by server');
 
-  // 6. Cryptographically verify the client signed the transaction
+  // 10. Verify all additional operations (beyond the first) have server as source
+  // Per SEP-10, any manageData operations after the first must be sourced by the server
+  // This prevents clients from injecting extra data with their own source
+  for (let i = 1; i < tx.operations.length; i++) {
+    const extraOp = tx.operations[i];
+    const extraOpSource = extraOp.source;
+    if (extraOpSource !== SERVER_KEYPAIR.publicKey()) {
+      throw new Error(`Operation ${i} must be sourced by the server account`);
+    }
+  }
+
+  // 11. Cryptographically verify the client signed the transaction
   // Using Keypair.verify() for proper ECDSA signature validation per SEP-10
   const clientKeypair = Keypair.fromPublicKey(clientAccountId);
   const clientSigned = tx.signatures.some((sig) => {
@@ -230,7 +284,7 @@ export function verifyAndIssueToken(xdr: string, role?: string): { token: string
 
   // 7. Reject replay of an already-redeemed challenge. SEP-10 intends each
   // challenge to be single-use; without this check, a captured signed
-  // challenge can be resubmitted for a fresh token as many times as desired
+  // challenge can be replayed within its TTL window.
   // within its TTL window.
   const nowSeconds = Math.floor(Date.now() / 1000);
   pruneConsumedChallengeNonces(nowSeconds);
@@ -241,14 +295,8 @@ export function verifyAndIssueToken(xdr: string, role?: string): { token: string
   }
   consumedChallengeNonces.set(nonceKey, maxTime > 0 ? maxTime : nowSeconds + CHALLENGE_TTL_SECONDS);
 
-  // Issue JWT with client account, role, and a unique JTI for revocation support
-  const jti = crypto.randomUUID();
-  const token = jwt.sign({ sub: clientAccountId, role: role ?? 'player', jti }, config.jwtSecret, {
-    expiresIn: TOKEN_TTL_SECONDS,
-  });
-
   span.setAttribute('sep10.account', clientAccountId);
-  return { token, account: clientAccountId };
+  return { account: clientAccountId };
   } catch (err) {
     // Normalise to a plain Error before re-throwing. The SDK can throw
     // DOMException or XdrError which in some JS sandbox environments (e.g.

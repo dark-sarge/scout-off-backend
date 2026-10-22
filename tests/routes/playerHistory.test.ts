@@ -20,10 +20,13 @@ describe("Player profile history", () => {
   let updateProfileSpy: jest.SpyInstance;
 
   beforeEach(() => {
+    // Spy on the defining module: the services/stellar barrel re-exports via
+    // `export *`, whose bindings are non-configurable getters that jest cannot
+    // redefine, but they forward to this module so the spy is still observed.
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const stellar = require("../../src/services/stellar");
+    const stellarProfiles = require("../../src/services/stellarProfiles");
     updateProfileSpy = jest
-      .spyOn(stellar, "updateProfile")
+      .spyOn(stellarProfiles, "updateProfile")
       .mockImplementationOnce(async () => ({
         transactionId: "tx-1",
         metadataUri: "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG",

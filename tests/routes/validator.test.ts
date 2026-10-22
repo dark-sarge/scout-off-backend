@@ -10,6 +10,7 @@ jest.mock('../../src/services/ipfs', () => ({
 
 jest.mock('../../src/db', () => ({
   queryEvents: jest.fn(),
+  getEventsCount: jest.fn().mockReturnValue(0),
   getPendingMilestones: jest.fn(),
   // approveBulkMilestones (validatorController.ts) reads pending_milestones
   // rows via getDriver() directly rather than a dedicated db/index.ts

@@ -72,6 +72,64 @@ if (!VALID_ENVS.has(rawNodeEnv)) {
 }
 const nodeEnv = rawNodeEnv as NodeEnv;
 
+function isLikelyPlaceholderSecret(secret: string): boolean {
+  const normalized = secret.trim().toLowerCase();
+  if (!normalized) return true;
+
+  const obviousPlaceholders = [
+    'changeme',
+    'change-me',
+    'change_me',
+    'example',
+    'example-secret',
+    'example_secret',
+    'jwt-secret',
+    'jwt_secret',
+    'replace-me',
+    'replace_me',
+    'secret',
+    'mysecret',
+    'test-secret',
+    'development-secret',
+  ];
+
+  return obviousPlaceholders.some((placeholder) => normalized === placeholder || normalized.includes(placeholder));
+}
+
+function validateSecretStrength(name: string, value: string): void {
+  const trimmed = value.trim();
+  const byteLength = new TextEncoder().encode(trimmed).length;
+
+  if (isLikelyPlaceholderSecret(trimmed)) {
+    if (nodeEnv === 'production' || nodeEnv === 'staging') {
+      throw new Error(
+        `${name} looks like a placeholder or default secret; set a unique value with at least 32 bytes.`,
+      );
+    }
+    if (nodeEnv === 'development') {
+      console.warn(
+        `[config] WARNING: ${name} looks like a placeholder or default secret; set a unique value with at least 32 bytes.`,
+      );
+    }
+    return;
+  }
+
+  if (nodeEnv === 'production' || nodeEnv === 'staging') {
+    if (byteLength < 32) {
+      throw new Error(
+        `${name} must be at least 32 bytes long in ${nodeEnv} (for example, 64 hex chars or 43+ base64 chars).`,
+      );
+    }
+    return;
+  }
+
+  if (nodeEnv === 'development' && byteLength < 32) {
+    console.warn(
+      `[config] WARNING: ${name} is shorter than 32 bytes in development; this is allowed for local testing but not recommended for production.`,
+    );
+  }
+}
+
 // Validate ADMIN_WALLET based on environment:
 // - production: throw immediately so the process never starts without it
 // - staging: emit a console warning (process continues)
@@ -143,6 +201,19 @@ if (!apiKeyLookupSecretValue) {
   }
 }
 
+// Validate NOTES_ENCRYPTION_KEY (#1328). Scout private notes are encrypted at
+// rest with this symmetric key; production refuses to start without it.
+const notesEncryptionKeyValue = process.env.NOTES_ENCRYPTION_KEY ?? '';
+if (!notesEncryptionKeyValue) {
+  if (nodeEnv === 'production') {
+    throw new Error(
+      'NOTES_ENCRYPTION_KEY is required in production but is not set. ' +
+      'Generate one with `openssl rand -hex 32` and set this variable. ' +
+      'See docs/secrets-rotation.md for rotation guidance.',
+    );
+  }
+}
+
 // Validate PINATA_GATEWAY when set — it must be a valid HTTPS URL. An invalid
 // gateway would otherwise only surface as a runtime failure when resolving
 // IPFS content, with no clear indication of the misconfiguration.
@@ -179,16 +250,68 @@ const corsAllowedOrigins =
     ? rawCorsOrigins.split(',').map((o) => o.trim()).filter(Boolean)
     : DEFAULT_CORS_ORIGINS[nodeEnv];
 
+// Validate NETWORK and derive networkPassphrase with defaults per network type.
+// Acceptable network values: 'testnet', 'mainnet', 'futurenet', 'standalone'.
+// Default passphrases follow Stellar's convention for each network type.
+const VALID_NETWORKS: ReadonlySet<string> = new Set(['testnet', 'mainnet', 'futurenet', 'standalone']);
+
+const rawNetwork = process.env.NETWORK ?? 'testnet';
+if (!VALID_NETWORKS.has(rawNetwork)) {
+  throw new Error(
+    `Invalid NETWORK: "${rawNetwork}". Must be one of: ${[...VALID_NETWORKS].join(', ')}. ` +
+    `Set NETWORK to a valid value or remove it to use the default (testnet).`,
+  );
+}
+const network = rawNetwork as 'testnet' | 'mainnet' | 'futurenet' | 'standalone';
+
+// Default passphrases per network type
+const DEFAULT_PASSPHRASES: Record<string, string> = {
+  testnet: 'Test SDF Network ; September 2015',
+  mainnet: 'Public Global Stellar Network ; September 2015',
+  futurenet: 'Test SDF Future Network ; October 2022',
+  standalone: 'Standalone Network ; February 2017',
+};
+
+const rawNetworkPassphrase = process.env.NETWORK_PASSPHRASE;
+const networkPassphrase = rawNetworkPassphrase ?? DEFAULT_PASSPHRASES[network];
+
+// Log the effective network and passphrase on startup for visibility
+console.log(
+  `[config] Network: ${network}`,
+  rawNetworkPassphrase ? '' : '(default)',
+  `Passphrase: "${networkPassphrase}"`,
+  rawNetworkPassphrase ? '' : '(default)',
+);
+
+// Validate NETWORK_PASSPHRASE is present (though we have defaults, explicit override should be set)
+if (!rawNetworkPassphrase && network === 'standalone') {
+  // For standalone, always require explicit passphrase to avoid misconfiguration
+  throw new Error(
+    'NETWORK_PASSPHRASE must be set when NETWORK=standalone. ' +
+    'For the local Soroban sandbox, set: NETWORK_PASSPHRASE="Standalone Network ; February 2017"',
+  );
+}
+
+// Guard: production with NETWORK != mainnet emits a warning
+// This helps catch accidental testnet/futurenet usage in production
+if (nodeEnv === 'production' && network !== 'mainnet') {
+  console.warn(
+    `[config] WARNING: Production deployment using ${network}. ` +
+    `This is not recommended for production. Set NETWORK=mainnet to suppress this warning.`,
+  );
+}
+
 const config = {
   nodeEnv,
   port: parseNumericEnv('PORT', process.env.PORT, 4000, { min: 0, max: 65535, integer: true }),
-  network: (process.env.NETWORK ?? 'testnet') as 'testnet' | 'mainnet',
-  networkPassphrase:
-    process.env.NETWORK_PASSPHRASE ?? 'Test SDF Network ; September 2015',
+  network,
+  networkPassphrase,
   horizonUrl:
-    process.env.HORIZON_URL ?? 'https://horizon-testnet.stellar.org',
+    process.env.HORIZON_URL ??
+    (network === 'mainnet' ? 'https://horizon.stellar.org' : 'https://horizon-testnet.stellar.org'),
   sorobanRpcUrl:
-    process.env.SOROBAN_RPC_URL ?? 'https://soroban-testnet.stellar.org',
+    process.env.SOROBAN_RPC_URL ??
+    (network === 'mainnet' ? 'https://sorobanrpc.stellar.org' : 'https://soroban-testnet.stellar.org'),
   /**
    * Legacy single-contract ID — kept for backward compatibility with any code
    * that has not yet been migrated to the per-contract IDs below.
@@ -216,7 +339,11 @@ const config = {
 
   /** Address of the deployed `connection` Soroban contract. */
   connectionContractId: process.env.CONNECTION_CONTRACT_ID ?? process.env.CONTRACT_ID ?? '',
-  jwtSecret: required('JWT_SECRET'),
+  jwtSecret: (() => {
+    const value = required('JWT_SECRET');
+    validateSecretStrength('JWT_SECRET', value);
+    return value;
+  })(),
   /**
    * SEP-10 server signing keypair secret (Stellar strkey starting with 'S').
    * Must be identical on every backend instance.  See docs/auth.md for
@@ -245,7 +372,11 @@ const config = {
       ],
   },
   platformFeeBps: parseNumericEnv('PLATFORM_FEE_BPS', process.env.PLATFORM_FEE_BPS, 500, { min: 0, max: 10000, integer: true }),
-  jwtSecretPrevious: process.env.JWT_SECRET_PREVIOUS ?? '',
+  jwtSecretPrevious: (() => {
+    const value = process.env.JWT_SECRET_PREVIOUS ?? '';
+    if (value) validateSecretStrength('JWT_SECRET_PREVIOUS', value);
+    return value;
+  })(),
   /**
    * Absolute end of the previous-secret grace window (epoch milliseconds).
    * Parsed from `JWT_SECRET_PREVIOUS_UNTIL` (Unix seconds or ISO-8601).
@@ -315,6 +446,10 @@ const config = {
    * free connection rather than failing. Ignored when DB_DRIVER=sqlite.
    */
   databasePoolSize: parseNumericEnv('DATABASE_POOL_SIZE', process.env.DATABASE_POOL_SIZE, 10, { min: 1, max: 100, integer: true }),
+  sqliteBusyTimeoutMs: parseNumericEnv('SQLITE_BUSY_TIMEOUT_MS', process.env.SQLITE_BUSY_TIMEOUT_MS, 5000, { min: 1, integer: true }),
+  databaseStatementTimeoutMs: parseNumericEnv('DB_STATEMENT_TIMEOUT_MS', process.env.DB_STATEMENT_TIMEOUT_MS, 25000, { min: 1, integer: true }),
+  databaseQueryTimeoutMs: parseNumericEnv('DB_QUERY_TIMEOUT_MS', process.env.DB_QUERY_TIMEOUT_MS, 30000, { min: 1, integer: true }),
+  databaseIdleTransactionTimeoutMs: parseNumericEnv('DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS', process.env.DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS, 60000, { min: 1, integer: true }),
   stellarHealthCheckEnabled: process.env.STELLAR_HEALTH_CHECK !== 'false',
   adminWallet: process.env.ADMIN_WALLET ?? '',
   adminWallets: (process.env.ADMIN_WALLETS ?? process.env.ADMIN_WALLET ?? '').split(',').map(w => w.trim()).filter(w => w.length > 0),
@@ -376,6 +511,10 @@ const config = {
   // webhook_subscriptions.secret at rest (#686). Required in production —
   // see src/utils/webhookSecretCipher.ts and docs/secrets-rotation.md.
   webhookSecretEncryptionKey: process.env.WEBHOOK_SECRET_ENCRYPTION_KEY ?? '',
+  webhookSecretEncryptionKeyPrevious: process.env.WEBHOOK_SECRET_ENCRYPTION_KEY_PREVIOUS ?? '',
+  // Symmetric key (32-byte hex) for scout_player_notes* content at rest (#1328).
+  notesEncryptionKey: process.env.NOTES_ENCRYPTION_KEY ?? '',
+  notesEncryptionKeyPrevious: process.env.NOTES_ENCRYPTION_KEY_PREVIOUS ?? '',
   rateLimit: {
     enabled: process.env.RATE_LIMIT_ENABLED !== 'false',
     windowMs: parseNumericEnv('RATE_LIMIT_WINDOW_MS', process.env.RATE_LIMIT_WINDOW_MS, 60000, { min: 1, integer: true }),
@@ -393,6 +532,7 @@ const config = {
   },
   authRateLimit: {
     windowMs: parseNumericEnv('AUTH_RATE_LIMIT_WINDOW_MS', process.env.AUTH_RATE_LIMIT_WINDOW_MS, 60000, { min: 1, integer: true }),
+    ipMax: parseNumericEnv('AUTH_RATE_LIMIT_IP_MAX', process.env.AUTH_RATE_LIMIT_IP_MAX, 60, { min: 1, integer: true }),
     max: parseNumericEnv('AUTH_RATE_LIMIT_MAX', process.env.AUTH_RATE_LIMIT_MAX, process.env.NODE_ENV === 'test' ? 1000 : 5, { min: 1, integer: true }),
   },
   playerImportRateLimit: {
@@ -434,6 +574,8 @@ const config = {
   subscriptionGracePeriodHours: parseNumericEnv('SUBSCRIPTION_GRACE_PERIOD_HOURS', process.env.SUBSCRIPTION_GRACE_PERIOD_HOURS, 24, { min: 0, integer: true }),
   /** Global request timeout in milliseconds before the server responds with 503. */
   requestTimeoutMs: parseNumericEnv('REQUEST_TIMEOUT_MS', process.env.REQUEST_TIMEOUT_MS, 30000, { min: 1, integer: true }),
+  /** Lease expiry for pending idempotency claims (ms). A crashed request releases its claim after this window. */
+  idempotencyLeaseMs: parseNumericEnv('IDEMPOTENCY_LEASE_MS', process.env.IDEMPOTENCY_LEASE_MS, 35000, { min: 1000, integer: true }),
   /**
    * Bounded Soroban transaction-confirmation poll window (ms). When a
    * submitted pay_to_contact/subscribe transaction has not reached a final
@@ -515,12 +657,16 @@ const config = {
 
   /** Maximum evidence file size in bytes (default: 50 MB). */
   evidenceMaxBytes: parseNumericEnv('EVIDENCE_MAX_BYTES', process.env.EVIDENCE_MAX_BYTES, 50 * 1024 * 1024, { min: 1, integer: true }),
+  evidenceValidatorBytesPerHour: parseNumericEnv('EVIDENCE_VALIDATOR_BYTES_PER_HOUR', process.env.EVIDENCE_VALIDATOR_BYTES_PER_HOUR, 500 * 1024 * 1024, { min: 1, integer: true }),
 
   /** TTL for multi-admin action proposals in milliseconds (default: 1 hour). */
   adminActionTtlMs: parseNumericEnv('ADMIN_ACTION_TTL_MS', process.env.ADMIN_ACTION_TTL_MS, 3600000, { min: 1, integer: true }),
 
   /** Minimum response size in bytes to trigger compression (default: 1024 bytes). */
   compressionThresholdBytes: parseNumericEnv('COMPRESSION_THRESHOLD', process.env.COMPRESSION_THRESHOLD ?? process.env.COMPRESSION_THRESHOLD_BYTES, 1024, { min: 1, integer: true }),
+
+  /** Base retry interval in milliseconds for SSE reconnect hints (default: 5000 ms). */
+  sseRetryMs: parseNumericEnv('SSE_RETRY_MS', process.env.SSE_RETRY_MS, 5000, { min: 1, integer: true }),
 
   /**
    * Maximum indexer ledger lag (in ledgers) allowed for readiness check.
@@ -565,6 +711,142 @@ const config = {
     intervalMs: parseNumericEnv('TIER_DIVERGENCE_INTERVAL_MS', process.env.TIER_DIVERGENCE_INTERVAL_MS, 300_000, { min: 1000, integer: true }),
     sampleSize: parseNumericEnv('TIER_DIVERGENCE_SAMPLE_SIZE', process.env.TIER_DIVERGENCE_SAMPLE_SIZE, 100, { min: 1, integer: true }),
   },
+
+  // ── Readiness / health check timeouts ──────────────────────────────────
+  // Per-component timeout for readiness probes (#1317)
+  readinessDb: {
+    timeoutMs: parseNumericEnv('READINESS_DB_TIMEOUT_MS', process.env.READINESS_DB_TIMEOUT_MS, 2000, { min: 1, integer: true }),
+  },
+  readinessIpfs: {
+    timeoutMs: parseNumericEnv('READINESS_IPFS_TIMEOUT_MS', process.env.READINESS_IPFS_TIMEOUT_MS, 5000, { min: 1, integer: true }),
+  },
+  readinessStellar: {
+    timeoutMs: parseNumericEnv('READINESS_STELLAR_TIMEOUT_MS', process.env.READINESS_STELLAR_TIMEOUT_MS, 5000, { min: 1, integer: true }),
+  },
+
+  // ── Server-Sent Events (SSE) ──────────────────────────────────────────
+  sse: {
+    /** Interval between keep-alive pings sent to SSE clients (ms). */
+    keepaliveIntervalMs: parseNumericEnv('SSE_KEEPALIVE_INTERVAL_MS', process.env.SSE_KEEPALIVE_INTERVAL_MS, 15000, { min: 1, integer: true }),
+    /** Max concurrent SSE connections (0 = unlimited). */
+    maxConnections: parseNumericEnv('SSE_MAX_CONNECTIONS', process.env.SSE_MAX_CONNECTIONS, 0, { min: 0, integer: true }),
+    /** Interval for shared SSE auth sweep (re-check revocations, blocklists). */
+    authSweepIntervalMs: parseNumericEnv('SSE_AUTH_SWEEP_INTERVAL_MS', process.env.SSE_AUTH_SWEEP_INTERVAL_MS, 30000, { min: 1, integer: true }),
+  },
+
+  // ── Wallet / cache settings ───────────────────────────────────────────
+  /** TTL for wallet blocklist cache entries (ms). */
+  walletBlocklistCacheTtlMs: parseNumericEnv('WALLET_BLOCKLIST_CACHE_TTL_MS', process.env.WALLET_BLOCKLIST_CACHE_TTL_MS, 30000, { min: 1, integer: true }),
+  
+  /** TTL for feature flag cache entries (ms). */
+  featureFlagCacheTtlMs: parseNumericEnv('FEATURE_FLAG_CACHE_TTL_MS', process.env.FEATURE_FLAG_CACHE_TTL_MS, 5000, { min: 1, integer: true }),
+
+  // ── In-memory cache limits ────────────────────────────────────────────
+  /** Max entries in generic cache stores (LRU eviction). */
+  cacheMaxSize: parseNumericEnv('CACHE_MAX_SIZE', process.env.CACHE_MAX_SIZE, 1000, { min: 1, integer: true }),
+  cacheMaxEntries: parseNumericEnv('CACHE_MAX_ENTRIES', process.env.CACHE_MAX_ENTRIES, 1000, { min: 1, integer: true }),
+  playerCacheMaxSize: parseNumericEnv('PLAYER_CACHE_MAX_SIZE', process.env.PLAYER_CACHE_MAX_SIZE, 1000, { min: 1, integer: true }),
+
+  // ── GraphQL DataLoader concurrency ────────────────────────────────────
+  /** Max in-flight RPC calls for the milestone GraphQL DataLoader. */
+  milestoneLoaderConcurrency: parseNumericEnv('MILESTONE_LOADER_CONCURRENCY', process.env.MILESTONE_LOADER_CONCURRENCY, 8, { min: 1, integer: true }),
+
+  // ── Reindexing / catch-up mode ────────────────────────────────────────
+  /** Ledger lag threshold for entering catch-up mode (ledgers). */
+  reindexCatchupThreshold: parseNumericEnv('REINDEX_CATCHUP_THRESHOLD', process.env.REINDEX_CATCHUP_THRESHOLD, 500, { min: 1, integer: true }),
+  /** Ledgers processed per batch in catch-up mode. */
+  reindexCatchupBatchSize: parseNumericEnv('REINDEX_CATCHUP_BATCH_SIZE', process.env.REINDEX_CATCHUP_BATCH_SIZE, 500, { min: 1, integer: true }),
+  /** Ledgers processed per batch in steady-state mode. */
+  reindexBatchSize: parseNumericEnv('REINDEX_BATCH_SIZE', process.env.REINDEX_BATCH_SIZE, 100, { min: 1, integer: true }),
+  /** Delay between reindex batches (ms). */
+  reindexBatchDelayMs: parseNumericEnv('REINDEX_BATCH_DELAY_MS', process.env.REINDEX_BATCH_DELAY_MS, 50, { min: 0, integer: true }),
+  /** Backoff when RPC returns rate-limit errors during reindex (ms). */
+  reindexRateLimitBackoffMs: parseNumericEnv('REINDEX_RATE_LIMIT_BACKOFF_MS', process.env.REINDEX_RATE_LIMIT_BACKOFF_MS, 2000, { min: 1, integer: true }),
+
+  // ── Indexer settings ──────────────────────────────────────────────────
+  /** Finality margin: ledgers to hold back from tip to avoid reorgs. */
+  indexerFinalityMargin: parseNumericEnv('INDEXER_FINALITY_MARGIN', process.env.INDEXER_FINALITY_MARGIN, 10, { min: 1, integer: true }),
+  /** Ledger lag threshold before warning logs are emitted. */
+  indexerLagWarnThreshold: parseNumericEnv('INDEXER_LAG_WARN_THRESHOLD', process.env.INDEXER_LAG_WARN_THRESHOLD, 100, { min: 1, integer: true }),
+
+  // ── Proxy settings ────────────────────────────────────────────────────
+  /** Number of trusted reverse-proxy hops in front of this server (for IP resolution). */
+  trustedProxyCount: parseNumericEnv('TRUSTED_PROXY_COUNT', process.env.TRUSTED_PROXY_COUNT, 1, { min: 1, integer: true }),
+
+  // ── Database query monitoring ─────────────────────────────────────────
+  /** Log queries slower than this threshold (ms). */
+  slowQueryThresholdMs: parseNumericEnv('SLOW_QUERY_THRESHOLD_MS', process.env.SLOW_QUERY_THRESHOLD_MS, 50, { min: 0, integer: true }),
+
+  // ── Circuit breakers ──────────────────────────────────────────────────
+  // Default circuit breaker thresholds for generic outbound calls (Stellar RPC, etc.).
+  circuitBreaker: {
+    failureThreshold: parseNumericEnv('CIRCUIT_BREAKER_FAILURE_THRESHOLD', process.env.CIRCUIT_BREAKER_FAILURE_THRESHOLD, 5, { min: 1, integer: true }),
+    resetTimeoutMs: parseNumericEnv('CIRCUIT_BREAKER_RESET_TIMEOUT_MS', process.env.CIRCUIT_BREAKER_RESET_TIMEOUT_MS, 30000, { min: 1, integer: true }),
+  },
+  // IPFS pinning circuit breaker (often tighter than generic).
+  ipfsBreaker: {
+    failureThreshold: parseNumericEnv('IPFS_BREAKER_FAILURE_THRESHOLD', process.env.IPFS_BREAKER_FAILURE_THRESHOLD, 5, { min: 1, integer: true }),
+    resetTimeoutMs: parseNumericEnv('IPFS_BREAKER_RESET_TIMEOUT_MS', process.env.IPFS_BREAKER_RESET_TIMEOUT_MS, 30000, { min: 1, integer: true }),
+  },
+
+  // ── Database migration validation (#1318) ─────────────────────────────
+  /** Migration checksum policy: "strict" fails startup on mismatch (prod), "warn" logs and continues (dev). */
+  migrationChecksumMode: (() => {
+    const mode = (process.env.MIGRATION_CHECKSUM_MODE ?? '').toLowerCase();
+    const valid = ['strict', 'warn'] as const;
+    const validStr = valid as readonly string[];
+    if (mode && !validStr.includes(mode)) {
+      throw new Error(`Invalid MIGRATION_CHECKSUM_MODE="${mode}". Must be one of: ${valid.join(', ')}`);
+    }
+    // Default: strict in production, warn in dev/staging/test
+    if (mode) return mode as typeof valid[number];
+    return nodeEnv === 'production' ? 'strict' : 'warn';
+  })(),
+
+  // ── Rate limiter failure policy (#1320) ────────────────────────────────
+  /**
+   * When the rate limiter's store (Redis) fails, what to do:
+   * - 'open': allow requests (fail-open, availability over security)
+   * - 'closed': reject with 503 (fail-closed, security over availability)
+   * - 'local': fall back to per-instance in-memory counters (hybrid)
+   * Default: 'open' for general routes, 'closed' for auth endpoints.
+   */
+  rateLimitErrorPolicy: (() => {
+    const policy = (process.env.RATE_LIMIT_ERROR_POLICY ?? '').toLowerCase();
+    const valid = ['open', 'closed', 'local'] as const;
+    const validStr = valid as readonly string[];
+    if (policy && !validStr.includes(policy)) {
+      throw new Error(`Invalid RATE_LIMIT_ERROR_POLICY="${policy}". Must be one of: ${valid.join(', ')}`);
+    }
+    return policy as typeof valid[number] | '';
+  })(),
+
+  authRateLimitErrorPolicy: (() => {
+    const policy = (process.env.AUTH_RATE_LIMIT_ERROR_POLICY ?? '').toLowerCase();
+    const valid = ['open', 'closed', 'local'] as const;
+    const validStr = valid as readonly string[];
+    if (policy && !validStr.includes(policy)) {
+      throw new Error(`Invalid AUTH_RATE_LIMIT_ERROR_POLICY="${policy}". Must be one of: ${valid.join(', ')}`);
+    }
+    // Auth endpoints default to more restrictive: closed in production, local elsewhere
+    if (policy) return policy as typeof valid[number];
+    return nodeEnv === 'production' ? 'closed' : 'local';
+  })(),
+
+  /** Only accept registered persisted GraphQL operations (GRAPHQL_PERSISTED_ONLY=true). */
+  graphqlPersistedOnly: process.env.GRAPHQL_PERSISTED_ONLY === 'true',
+
+  /** Shut down on an unhandled promise rejection (EXIT_ON_UNHANDLED_REJECTION=true). */
+  exitOnUnhandledRejection: process.env.EXIT_ON_UNHANDLED_REJECTION === 'true',
+
+  /**
+   * Web authentication domain for SEP-10 web_auth_domain operation.
+   * When set, the SEP-10 challenge will include a server-sourced manageData
+   * operation with name 'web_auth_domain' and value set to this domain.
+   * This is optional per SEP-10 and is used for web-based authentication flows.
+   * See docs/auth.md for details.
+   */
+  webAuthDomain: process.env.WEB_AUTH_DOMAIN ?? '',
 
 };
 

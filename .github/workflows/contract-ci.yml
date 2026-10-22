@@ -23,7 +23,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.81.0
           targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
 
       - name: Cache cargo registry and target
         uses: actions/cache@v4
@@ -37,6 +39,17 @@ jobs:
       - name: Build contracts (WASM)
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: contracts
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+        working-directory: contracts
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+        working-directory: contracts
+
+      - name: Report optimized WASM sizes
+        run: bash scripts/report-contract-wasm-size.sh
 
       # contracts/.cargo/config.toml sets wasm32-unknown-unknown as the
       # default build target for this workspace, so host-target commands

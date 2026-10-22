@@ -41,9 +41,11 @@ Response codes:
 | Status | Meaning                                                                 |
 | ------ | ----------------------------------------------------------------------- |
 | `200`  | Stream opened; frames start arriving                                    |
+| `400`  | Invalid `eventType` filter (`{ success: false, error, code: "VALIDATION_ERROR", validEventTypes }`) |
 | `401`  | Missing or invalid token (`{ success: false, error }`)                  |
-| `403`  | Wallet is blocklisted — stream access revoked                           |
-| `503`  | Connection limit reached (`SSE_MAX_CONNECTIONS`) — retry later          |
+| `403`  | Wallet is blocklisted — stream access revoked (`code: WALLET_BLOCKLISTED`) |
+| `429`  | Per-wallet stream limit reached (`SSE_MAX_CONNECTIONS_PER_WALLET`)       |
+| `503`  | Process-wide stream limit reached (`SSE_MAX_CONNECTIONS`) — `code: SSE_CAPACITY`; retry after the `Retry-After` header (seconds) |
 
 ## Connecting
 
@@ -77,10 +79,13 @@ es.onopen = () => console.log('stream open');
 es.onmessage = (e) => console.log('event:', e.data);
 ```
 
-On connect the server immediately sends an initial frame so the client knows
+On connect the server immediately sends a `retry:` frame (with small random jitter
+to avoid reconnect storms) alongside the `connected` event so the client knows
 the stream is live:
 
 ```
+retry: 5234
+
 event: connected
 data: {"wallet":"GABCDEF..."}
 
@@ -94,7 +99,7 @@ further on top of it.
 
 | Parameter   | Type   | Behaviour                                                                                                                              |
 | ----------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `eventType` | string | Subscribe to a single event type, e.g. `?eventType=milestone_approved`. Omitted = receive all event types that pass the relevance filter. Unknown values are ignored. |
+| `eventType` | string | Subscribe to one or more event types as a comma-separated list, e.g. `?eventType=milestone_approved,contact_unlocked`. Omitted = receive all event types that pass the relevance filter. Unknown values are rejected with `400`. |
 | `playerId`  | string | Only deliver events whose payload contains this player identifier. Omitted = no additional player-level narrowing.                       |
 
 Examples:
@@ -102,6 +107,9 @@ Examples:
 ```text
 # Only my milestone approvals
 GET /api/events/stream?eventType=milestone_approved
+
+# Multiple types (comma-separated)
+GET /api/events/stream?eventType=milestone_approved,contact_unlocked
 
 # Only events about one player (any type)
 GET /api/events/stream?playerId=player-001
@@ -123,8 +131,30 @@ Filterable `eventType` values (validated against this exact list):
 > **Note:** the stream can also carry `player_deactivated`, `player_reactivated`,
 > `trial_offer_accepted`, and `trial_offer_rejected` frames (they pass the
 > relevance filter), but those types are **not** currently accepted as
-> `eventType` filter values — an unknown filter value is silently ignored, so a
-> filter for them behaves like no filter at all.
+> `eventType` filter values — requesting one returns `400` with the list of
+> valid types in `validEventTypes`.
+
+### Invalid `eventType`
+
+If any requested value is not in the valid list above, the request is rejected
+with `400` **before** the stream opens:
+
+```json
+{
+  "success": false,
+  "error": "Unknown eventType: 'milestone_aproved'",
+  "code": "VALIDATION_ERROR",
+  "validEventTypes": [
+    "player_registered",
+    "milestone_submitted",
+    "milestone_approved",
+    "scout_subscribed",
+    "contact_unlocked",
+    "trial_offer_logged",
+    "fees_withdrawn"
+  ]
+}
+```
 
 ## Frame format
 
@@ -148,8 +178,9 @@ Other frames you may see:
 
 | Frame type     | When                                            | Payload                                   |
 | -------------- | ----------------------------------------------- | ----------------------------------------- |
+| `retry:`       | Once, immediately on connect                    | Integer milliseconds (e.g. `5234`); sets client reconnect delay |
 | `connected`    | Once, immediately after the stream opens        | `{ "wallet": "<your wallet>" }`           |
-| `session_ended`| The stream is being closed (see live auth below)| `{ "reason": "token_revoked" \| "wallet_blocklisted" }` |
+| `session_ended`| The stream is being closed (see live auth below)| `{ "reason": "token_revoked" \| "wallet_blocklisted" \| "token_expired" }` |
 | `: ping`       | Keep-alive comment every `SSE_KEEPALIVE_INTERVAL_MS` (default 15 s) | — (comment only, ignored by EventSource) |
 
 The `data` field is JSON; parse it with `JSON.parse(e.data)`.
@@ -184,6 +215,7 @@ self-documenting and future-proof.
 The two filter layers compose with **AND** semantics:
 
 1. `isEventRelevantToWallet` — wallet isolation, always enforced.
+2. `isEventMatchingFilter` — the optional `eventType`
 2. `isEventMatchingFilter` — the optional `eventType` / `playerId` narrowing.
 
 A `playerId` filter matches if any payload field that carries a player identity
@@ -199,11 +231,17 @@ relevance check (wildcard behaviour).
 - **Compression:** gzip/br compression is **disabled** for the SSE paths
   (`/api/events/stream`, `/api/v1/events/stream`, `/api/v2/events/stream`) —
   SSE responses are written incrementally and compression would buffer them.
-- **Connection limit:** `SSE_MAX_CONNECTIONS` caps concurrent streams
-  (default `0` = unlimited). Exceeding it returns `503`.
+- **Connection limits:** `SSE_MAX_CONNECTIONS_PER_WALLET` caps concurrent
+  streams per wallet (default `5`; `0` = unlimited, exceeded limit returns
+  `429`). `SSE_MAX_CONNECTIONS` caps total process-wide streams (default `0` =
+  unlimited, exceeded limit returns `503`).
 
 ## Reconnection and replay behaviour (known limitations)
 
+- **Reconnection delay (`retry:` hint):** On connect, the server sends a `retry: <ms>`
+  hint (configured by `SSE_RETRY_MS`, default `5000` ms, plus up to 20% random jitter per
+  connection). Standard SSE clients (including `EventSource`) honour this hint to avoid
+  synchronized reconnect storms across clients.
 - There is **no `id:` field in event frames and no `Last-Event-ID` replay**.
   If the connection drops, the server does not buffer missed events and cannot
   resume the stream from a client-supplied offset.
@@ -223,6 +261,8 @@ Once a stream is open, authorization is re-checked continuously (issue #1019):
   closes the connection.
 - If the wallet is blocklisted, the same happens with reason
   `wallet_blocklisted`.
+- When the access JWT expires, the stream emits `session_ended` with reason
+  `token_expired` and closes. Clients must reconnect with a fresh token.
 - Detection is immediate for revocations/blocklists processed in the same
   process, and within `SSE_AUTH_SWEEP_INTERVAL_MS` (default 30 s) for changes
   persisted by another backend instance. A blocklisted wallet also cannot open
@@ -235,7 +275,9 @@ for the full model.
 
 | Variable                    | Default | Description                                             |
 | --------------------------- | ------- | ------------------------------------------------------- |
+| `SSE_RETRY_MS`              | `5000`  | Base reconnect delay hint sent in `retry:` frame (ms)   |
 | `SSE_KEEPALIVE_INTERVAL_MS` | `15000` | Interval between keep-alive `: ping` comments (ms)      |
+| `SSE_MAX_CONNECTIONS_PER_WALLET` | `5` | Max concurrent streams per wallet; `0` = unlimited       |
 | `SSE_MAX_CONNECTIONS`       | `0`     | Max concurrent streams; `0` = unlimited                 |
 | `SSE_AUTH_SWEEP_INTERVAL_MS`| `30000` | Cross-process auth sweep interval (ms)                  |
 

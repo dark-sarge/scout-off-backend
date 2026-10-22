@@ -12,10 +12,15 @@ const isoDateString = z
 // Contract event types enum
 const EVENT_TYPES = [
   'player_registered',
+  'profile_updated',
   'milestone_approved',
   'milestone_rejected',
   'scout_subscribed',
   'contact_unlocked',
+  'connection_created',
+  'token_issued',
+  'token_bought',
+  'platform_fee_updated',
   'fees_withdrawn',
   'validator_registered',
   'validator_revoked',

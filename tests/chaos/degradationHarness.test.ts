@@ -6,7 +6,9 @@
 import request from 'supertest';
 import app from '../../src/app';
 import * as ipfs from '../../src/services/ipfs';
-import * as stellar from '../../src/services/stellar';
+// Spy on the defining module: the services/stellar barrel's `export *`
+// bindings are non-configurable getters that jest cannot redefine.
+import * as stellar from '../../src/services/stellarCore';
 
 type Dep = 'redis' | 'db' | 'rpc' | 'ipfs';
 export type FaultSet = Partial<Record<Dep, boolean>>;

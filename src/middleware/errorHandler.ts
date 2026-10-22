@@ -62,8 +62,17 @@ export function errorHandler(
     err != null && typeof (err as Record<string, unknown>).message === 'string'
       ? (err as Record<string, unknown>).message as string
       : 'Internal Server Error';
+  const errStack =
+    err != null && typeof (err as Record<string, unknown>).stack === 'string'
+      ? (err as Record<string, unknown>).stack as string
+      : undefined;
 
-  logger.error(`[error] ${errMessage}${correlationId ? ` correlationId=${correlationId}` : ''}`);
+  const logMessage = `[error] ${errMessage}${correlationId ? ` correlationId=${correlationId}` : ''}`;
+  if (errStack) {
+    logger.error(logMessage, errStack);
+  } else {
+    logger.error(logMessage);
+  }
 
   // Cast to HttpError for property access — we validate each field before use
   const httpErr = err as HttpError;
@@ -104,7 +113,7 @@ export function errorHandler(
   const status =
     httpErr != null && isValidErrorStatus(httpErr.status) ? httpErr.status : 500;
 
-  const message = errMessage || 'Internal Server Error';
+  const message = status >= 500 ? 'Internal Server Error' : errMessage || 'Internal Server Error';
 
   // Preserve explicit error codes if already set on the error object,
   // otherwise determine the appropriate code based on HTTP status.

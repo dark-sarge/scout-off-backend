@@ -124,7 +124,9 @@ describe('replayDeadLetter', () => {
     const call = mockedFetch.mock.calls.find(([calledUrl]) => calledUrl === url);
     expect(call).toBeDefined();
     const [, init] = call!;
-    expect((init!.headers as Record<string, string>)['X-Webhook-Signature']).toMatch(/^sha256=[0-9a-f]{64}$/);
+    const headers = init!.headers as Record<string, string>;
+    expect(headers['X-Webhook-Timestamp']).toMatch(/^\d+$/);
+    expect(headers['X-Webhook-Signature']).toMatch(/^sha256=[0-9a-f]{64}$/);
   });
 
   it(

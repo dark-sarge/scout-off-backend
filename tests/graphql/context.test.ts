@@ -10,7 +10,7 @@ jest.mock('../../src/utils/jwt', () => ({
   tryVerifyJwt: jest.fn(),
 }));
 
-jest.mock('../../src/controllers/apiKeyController', () => ({
+jest.mock('../../src/services/apiKeyService', () => ({
   resolveApiKey: jest.fn(),
 }));
 
@@ -21,7 +21,7 @@ jest.mock('../../src/db', () => ({
 import { createContext } from '../../src/graphql/context';
 import { isTokenRevoked } from '../../src/services/tokenBlocklist';
 import { tryVerifyJwt } from '../../src/utils/jwt';
-import { resolveApiKey } from '../../src/controllers/apiKeyController';
+import { resolveApiKey } from '../../src/services/apiKeyService';
 
 const mockIsTokenRevoked = isTokenRevoked as jest.Mock;
 const mockTryVerifyJwt = tryVerifyJwt as jest.Mock;

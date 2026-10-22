@@ -16,15 +16,11 @@
 /// Each proptest! block runs 10 000 cases.
 #[cfg(test)]
 mod connection_invariants {
-    use proptest::prelude::*;
     use connection::{ConnectionContract, ConnectionContractClient};
+    use proptest::prelude::*;
     use register::{RegisterContract, RegisterContractClient};
+    use soroban_sdk::{testutils::Address as _, token::StellarAssetClient, Address, Env, String};
     use subscription::{SubscriptionContract, SubscriptionContractClient};
-    use soroban_sdk::{
-        testutils::Address as _,
-        token::StellarAssetClient,
-        Address, Env, String,
-    };
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -59,7 +55,9 @@ mod connection_invariants {
         // the "token" address must be a live Stellar Asset Contract, not a bare
         // generated Address — otherwise every transfer call traps with
         // Error(Storage, MissingValue) (no contract instance to invoke).
-        let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let token = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
 
         let reg_id = env.register_contract(None, RegisterContract);
         let sub_id = env.register_contract(None, SubscriptionContract);
@@ -310,7 +308,7 @@ mod connection_invariants {
             // needs to stay well under u32::MAX / LEDGERS_PER_DAY (~248 000).
             sub.subscribe(&scout, &1u32, &100_000u32);
 
-            let mut min_levels = vec![0u32; 3];
+            let mut min_levels = [0u32; 3];
 
             for (use_subscription, pidx) in &ops {
                 let player_id = player_ids[*pidx];

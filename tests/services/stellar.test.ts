@@ -79,6 +79,13 @@ jest.mock('../../src/utils/signer', () => ({
   }),
 }));
 
+jest.mock('../../src/db', () => ({
+  getPlayerById: jest.fn().mockResolvedValue({
+    player_id: 'api-player-cuid',
+    on_chain_player_id: '42',
+  }),
+}));
+
 import {
   isSubscribed,
   queryMilestones,

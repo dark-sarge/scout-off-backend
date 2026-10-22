@@ -45,16 +45,33 @@ export const ErrorCode = {
   MALFORMED_JSON: 'MALFORMED_JSON',
 
   /**
-   * HTTP 413 — Request body size exceeds the server limit (~100KB).
+   * HTTP 413 — Request body size exceeds the configured server limit.
+   * Limits are configurable via env vars (see src/config.ts `bodyLimit`):
+   *   - JSON_PAYLOAD_LIMIT (default 1 MB) — general JSON request bodies
+   *   - UPLOAD_PAYLOAD_LIMIT (default 10 MB) — file upload routes
+   *   - AUTH_PAYLOAD_LIMIT (default 100 KB) — auth routes
    * Client should: Reduce payload size; split into multiple requests if needed.
+   * See BACKEND_API_DOCS.md and docs/API_DOCUMENTATION.md for details.
    */
   PAYLOAD_TOO_LARGE: 'PAYLOAD_TOO_LARGE',
+
+  /**
+   * HTTP 429 — The client exceeded a request rate limit.
+   * Client should: Wait for the duration in the `Retry-After` response header before retrying.
+   */
+  RATE_LIMITED: 'RATE_LIMITED',
 
   /**
    * HTTP 415 — Request Content-Type is not supported (e.g., text/plain instead of application/json).
    * Client should: Set Content-Type: application/json in request headers.
    */
   UNSUPPORTED_MEDIA_TYPE: 'UNSUPPORTED_MEDIA_TYPE',
+
+  /**
+   * HTTP 503 — The request exceeded REQUEST_TIMEOUT_MS and was aborted by the timeout middleware.
+   * Client should: Retry with exponential backoff, reusing the same Idempotency-Key for mutating requests.
+   */
+  REQUEST_TIMEOUT: 'REQUEST_TIMEOUT',
 
   // ── Auth ──────────────────────────────────────────────────────────────────
   /**
@@ -193,6 +210,19 @@ export const ErrorCode = {
    * Client should: Check the action status; cannot re-approve completed actions.
    */
   ACTION_EXECUTED: 'ACTION_EXECUTED',
+
+  // ── Server-Sent Events ─────────────────────────────────────────────────────
+  /**
+   * HTTP 403 — The authenticated wallet is blocklisted and may not open an SSE stream.
+   * Client should: Do not reconnect; contact support if you believe this is an error.
+   */
+  WALLET_BLOCKLISTED: 'WALLET_BLOCKLISTED',
+
+  /**
+   * HTTP 503 — The server has reached its SSE connection limit (SSE_MAX_CONNECTIONS).
+   * Client should: Reconnect after the number of seconds given in the Retry-After header.
+   */
+  SSE_CAPACITY: 'SSE_CAPACITY',
 } as const;
 
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
