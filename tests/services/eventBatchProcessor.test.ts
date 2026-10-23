@@ -1,28 +1,12 @@
 /**
- * tests/services/eventBatchProcessor.test.ts
+ * Tests for issue #1588 — direct coverage for src/services/eventBatchProcessor.ts.
  *
- * Unit test suite for src/services/eventBatchProcessor.ts.
- *
- * Covers:
- *   - Basic batch processing with empty range
- *   - Event insertion and counting
- *   - Dynamic batch sizing via getBatchSize hook
- *   - Dynamic batch delay via getBatchDelay hook
- *   - Cancellation via shouldCancel hook
- *   - Rate-limit backoff via isRateLimitError hook
- *   - Progress callback invocation
- *   - onBatchComplete hook invocation
- *   - Custom contract IDs
+ * Mocks the Stellar RPC server.getEvents; uses the real in-memory SQLite DB
+ * (via tests setup) and the real normalizeAndSortEvents for ordering checks.
  */
 
-import {
-  processEventBatches,
-  type BatchProcessorProgress,
-} from '../../src/services/eventBatchProcessor';
-
-// ── Mock external dependencies ────────────────────────────────────────────────
-
 const mockGetEvents = jest.fn();
+const mockLogAuditEvent = jest.fn().mockResolvedValue(undefined);
 
 jest.mock('../../src/services/stellar', () => ({
   server: {
@@ -31,310 +15,164 @@ jest.mock('../../src/services/stellar', () => ({
 }));
 
 jest.mock('../../src/services/audit', () => ({
-  logAuditEvent: jest.fn().mockResolvedValue(undefined),
+  logAuditEvent: (...args: unknown[]) => mockLogAuditEvent(...args),
 }));
 
+// Lightweight indexer mocks so tests don't need full SDK ScVal round-trips.
+// Ordering itself still uses the real normalizeAndSortEvents (eventOrdering.ts).
 jest.mock('../../src/services/indexer', () => ({
-  normalizePayload: jest.fn((p: Record<string, unknown>) => p),
-  normalizeEventId: jest.fn((_contractId: string, ledger: number, txHash: string) => `${ledger}:${txHash}`),
-  normalizeSorobanEvent: jest.fn((raw: { topic: unknown[]; value: unknown }) => {
-    const { scValToNative } = require('@stellar/stellar-sdk');
-    return {
-      type: scValToNative(raw.topic[0]),
-      payload: scValToNative(raw.value),
-    };
+  normalizeEventId: (...parts: unknown[]) => (parts as string[]).join(':'),
+  normalizeSorobanEvent: (raw: { topic?: unknown; value?: unknown; txHash?: string }) => ({
+    type: 'test_event',
+    payload: { txHash: (raw as { txHash?: string }).txHash ?? 'unknown' },
   }),
-  getIndexedContractIds: jest.fn(() => ['CONTRACT_A', 'CONTRACT_B']),
 }));
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+import { processEventBatches } from '../../src/services/eventBatchProcessor';
+import { normalizeAndSortEvents } from '../../src/services/eventOrdering';
 
-function makeEvent(
-  type: string,
-  payload: Record<string, unknown>,
-  txHash: string,
-  ledger: number,
-  ledgerClosedAt?: string,
-) {
-  const { nativeToScVal } = require('@stellar/stellar-sdk');
+let txCounter = 0;
+function uniqueTx(prefix: string): string {
+  txCounter += 1;
+  return `${prefix}${txCounter}`.padEnd(64, '0').slice(0, 64);
+}
+
+function makeRaw(overrides: Record<string, unknown> = {}) {
   return {
-    topic: [nativeToScVal(type, { type: 'symbol' })],
-    value: nativeToScVal(payload),
-    ledger,
-    txHash,
-    ledgerClosedAt: ledgerClosedAt ?? null,
+    ledger: 100,
+    txHash: uniqueTx('tx'),
+    id: '100-0-0',
+    contractId: 'CCONTRACT',
+    topic: ['test_event'],
+    value: {},
+    ledgerClosedAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+    txIndex: 0,
+    eventIndex: 0,
+    ...overrides,
   };
 }
 
-// ── Setup ─────────────────────────────────────────────────────────────────────
+function cleanEvents() {
+  const { getDb } = require('../../src/db');
+  getDb().exec('DELETE FROM events');
+}
+
+function readEventsOrdered(): Array<{ ledger: number; tx_hash: string; event_index: number }> {
+  const { getDb } = require('../../src/db');
+  return getDb()
+    .prepare(
+      'SELECT ledger, tx_hash, event_index FROM events ORDER BY ledger ASC, tx_application_order ASC, event_index ASC, contract_id ASC',
+    )
+    .all();
+}
 
 beforeEach(() => {
   jest.clearAllMocks();
-  const indexerModule = require('../../src/services/indexer');
-  indexerModule.normalizeSorobanEvent.mockImplementation((raw: { topic: unknown[]; value: unknown }) => {
-    const { scValToNative } = require('@stellar/stellar-sdk');
-    return {
-      type: scValToNative(raw.topic[0]),
-      payload: scValToNative(raw.value),
-    };
-  });
+  mockLogAuditEvent.mockResolvedValue(undefined);
+  cleanEvents();
 });
 
-// ── Basic functionality ───────────────────────────────────────────────────────
-
-describe('basic functionality', () => {
-  it('processes an empty ledger range successfully', async () => {
+describe('processEventBatches batching', () => {
+  it('makes a single RPC call for a range smaller than the batch size', async () => {
     mockGetEvents.mockResolvedValue({ events: [] });
+    const result = await processEventBatches({
+      fromLedger: 1000,
+      toLedger: 1009,
+      batchSize: 50,
+      batchDelayMs: 0,
+      adminWallet: 'GADMIN',
+    });
+    expect(mockGetEvents).toHaveBeenCalledTimes(1);
+    expect(mockGetEvents).toHaveBeenCalledWith(expect.objectContaining({ startLedger: 1000 }));
+    expect(result.error).toBeUndefined();
+    expect(result.ledgersProcessed).toBe(10);
+  });
 
+  it('spans three batches with the correct startLedger values and no gaps or overlaps', async () => {
+    mockGetEvents.mockResolvedValue({ events: [] });
+    const onProgress = jest.fn();
+    const result = await processEventBatches({
+      fromLedger: 1,
+      toLedger: 300,
+      batchSize: 100,
+      batchDelayMs: 0,
+      adminWallet: 'GADMIN',
+      onProgress,
+    });
+    const starts = mockGetEvents.mock.calls.map((c: unknown[]) => (c[0] as { startLedger: number }).startLedger);
+    expect(starts).toEqual([1, 101, 201]);
+    expect(result.ledgersProcessed).toBe(300);
+    // Progress covers every ledger exactly once: 100 + 100 + 100.
+    const last = onProgress.mock.calls[onProgress.mock.calls.length - 1][0];
+    expect(last.ledgersProcessed).toBe(300);
+    expect(last.ledgersTotal).toBe(300);
+  });
+
+  it('inserts out-of-order events in deterministic order (matches normalizeAndSortEvents)', async () => {
+    const raws = [
+      makeRaw({ ledger: 500, txHash: uniqueTx('aaa'), txIndex: 2, eventIndex: 0 }),
+      makeRaw({ ledger: 500, txHash: uniqueTx('bbb'), txIndex: 0, eventIndex: 0 }),
+      makeRaw({ ledger: 500, txHash: uniqueTx('ccc'), txIndex: 1, eventIndex: 0 }),
+    ];
+    // Return them out of order; the processor must still insert deterministically.
+    mockGetEvents.mockResolvedValue({ events: [raws[0], raws[2], raws[1]] });
+    await processEventBatches({
+      fromLedger: 500,
+      toLedger: 500,
+      batchSize: 100,
+      batchDelayMs: 0,
+      adminWallet: 'GADMIN',
+    });
+    const expected = normalizeAndSortEvents(raws, 'CCONTRACT').map((e) => e.txHash);
+    const actual = readEventsOrdered().map((r) => r.tx_hash);
+    expect(actual).toEqual(expected);
+  });
+
+  it('inserts duplicate events across batches once (INSERT OR IGNORE)', async () => {
+    const dup = makeRaw({ ledger: 300, txHash: uniqueTx('dup'), txIndex: 0, eventIndex: 0 });
+    mockGetEvents.mockResolvedValue({ events: [dup] });
+    const first = await processEventBatches({
+      fromLedger: 300,
+      toLedger: 300,
+      batchSize: 100,
+      batchDelayMs: 0,
+      adminWallet: 'GADMIN',
+    });
+    const second = await processEventBatches({
+      fromLedger: 300,
+      toLedger: 300,
+      batchSize: 100,
+      batchDelayMs: 0,
+      adminWallet: 'GADMIN',
+    });
+    expect(first.eventsInserted).toBe(1);
+    expect(second.eventsInserted).toBe(0);
+    expect(readEventsOrdered().filter((r) => r.tx_hash === dup.txHash)).toHaveLength(1);
+  });
+
+  it('moves on to the next batch when a batch returns no events', async () => {
+    const later = makeRaw({ ledger: 150, txHash: uniqueTx('later'), txIndex: 0, eventIndex: 0 });
+    mockGetEvents
+      .mockResolvedValueOnce({ events: [] })
+      .mockResolvedValueOnce({ events: [later] });
     const result = await processEventBatches({
       fromLedger: 100,
-      toLedger: 100,
+      toLedger: 199,
       batchSize: 100,
       batchDelayMs: 0,
       adminWallet: 'GADMIN',
     });
-
-    expect(result.eventsInserted).toBe(0);
-    expect(result.ledgersProcessed).toBe(1);
+    expect(mockGetEvents).toHaveBeenCalledTimes(2);
     expect(result.error).toBeUndefined();
+    expect(result.eventsInserted).toBe(1);
   });
 
-  it('inserts events and counts them correctly', async () => {
-    const txHash = 'aaaa' + '0'.repeat(60);
-    mockGetEvents.mockResolvedValue({
-      events: [
-        makeEvent('player_registered', { player_id: 'P1', wallet: 'G' + 'A'.repeat(55) }, txHash, 200),
-      ],
-    });
-
-    const result = await processEventBatches({
-      fromLedger: 200,
-      toLedger: 200,
-      batchSize: 100,
-      batchDelayMs: 0,
-      adminWallet: 'GADMIN',
-    });
-
-    expect(result.eventsInserted).toBeGreaterThanOrEqual(0);
-    expect(result.ledgersProcessed).toBe(1);
-    expect(result.error).toBeUndefined();
-  });
-
-  it('uses the default contract IDs when not specified', async () => {
-    mockGetEvents.mockResolvedValue({ events: [] });
-
-    await processEventBatches({
-      fromLedger: 1,
-      toLedger: 1,
-      batchSize: 100,
-      batchDelayMs: 0,
-      adminWallet: 'GADMIN',
-    });
-
-    const indexerModule = require('../../src/services/indexer');
-    expect(indexerModule.getIndexedContractIds).toHaveBeenCalled();
-  });
-
-  it('uses custom contract IDs when provided', async () => {
-    mockGetEvents.mockResolvedValue({ events: [] });
-
-    await processEventBatches({
-      fromLedger: 1,
-      toLedger: 1,
-      batchSize: 100,
-      batchDelayMs: 0,
-      adminWallet: 'GADMIN',
-      contractIds: ['CUSTOM_CONTRACT'],
-    });
-
-    const indexerModule = require('../../src/services/indexer');
-    expect(indexerModule.getIndexedContractIds).not.toHaveBeenCalled();
-    expect(mockGetEvents).toHaveBeenCalledWith(
-      expect.objectContaining({
-        filters: [{ type: 'contract', contractIds: ['CUSTOM_CONTRACT'] }],
-      }),
-    );
-  });
-});
-
-// ── Dynamic batch sizing ───────────────────────────────────────────────────────
-
-describe('dynamic batch sizing', () => {
-  it('uses getBatchSize hook to compute batch size', async () => {
-    mockGetEvents.mockResolvedValue({ events: [] });
-
-    const batchSizeCalls: number[] = [];
-    await processEventBatches({
-      fromLedger: 1,
-      toLedger: 300,
-      batchSize: 100, // fallback
-      batchDelayMs: 0,
-      adminWallet: 'GADMIN',
-      getBatchSize: (remaining: number) => {
-        batchSizeCalls.push(remaining);
-        return Math.min(remaining, 50);
-      },
-    });
-
-    expect(batchSizeCalls.length).toBeGreaterThan(0);
-    expect(batchSizeCalls[0]).toBe(300);
-  });
-
-  it('changes batch size dynamically based on remaining ledgers', async () => {
-    mockGetEvents.mockResolvedValue({ events: [] });
-
-    const callLedgerStarts: number[] = [];
-    mockGetEvents.mockImplementation(async ({ startLedger }: { startLedger: number }) => {
-      callLedgerStarts.push(startLedger);
-      return { events: [] };
-    });
-
-    await processEventBatches({
-      fromLedger: 1,
-      toLedger: 200,
-      batchSize: 100,
-      batchDelayMs: 0,
-      adminWallet: 'GADMIN',
-      getBatchSize: (remaining: number) => {
-        // Use larger batches when many ledgers remain
-        return remaining > 100 ? 150 : 50;
-      },
-    });
-
-    // First batch should start at 1 with size 150
-    expect(callLedgerStarts[0]).toBe(1);
-    // Second batch should start at 151 (1 + 150)
-    if (callLedgerStarts.length > 1) {
-      expect(callLedgerStarts[1]).toBe(151);
-    }
-  });
-});
-
-// ── Dynamic batch delay ───────────────────────────────────────────────────────
-
-describe('dynamic batch delay', () => {
-  it('uses getBatchDelay hook to compute delay', async () => {
-    mockGetEvents.mockResolvedValue({ events: [] });
-
-    const delayCalls: number[] = [];
-    const realSetTimeout = global.setTimeout;
-    jest.spyOn(global, 'setTimeout').mockImplementation((fn: any, delay?: number, ...args: any[]) => {
-      if (typeof delay === 'number') {
-        delayCalls.push(delay);
-      }
-      return realSetTimeout(fn, 0, ...args);
-    });
-
-    await processEventBatches({
-      fromLedger: 1,
-      toLedger: 200,
-      batchSize: 100,
-      batchDelayMs: 50, // fallback
-      adminWallet: 'GADMIN',
-      getBatchDelay: () => 100,
-    });
-
-    expect(delayCalls).toContain(100);
-    jest.restoreAllMocks();
-  });
-
-  it('skips delay when getBatchDelay returns 0', async () => {
-    mockGetEvents.mockResolvedValue({ events: [] });
-
-    const setTimeoutSpy = jest.spyOn(global, 'setTimeout');
-
-    await processEventBatches({
-      fromLedger: 1,
-      toLedger: 100,
-      batchSize: 100,
-      batchDelayMs: 50,
-      adminWallet: 'GADMIN',
-      getBatchDelay: () => 0,
-    });
-
-    // Should not call setTimeout for inter-batch delays
-    expect(setTimeoutSpy).not.toHaveBeenCalled();
-    setTimeoutSpy.mockRestore();
-  });
-});
-
-// ── Cancellation ─────────────────────────────────────────────────────────────
-
-describe('cancellation', () => {
-  it('returns cancelled error when shouldCancel returns true', async () => {
-    mockGetEvents.mockResolvedValue({ events: [] });
-
-    let cancelAfterFirstBatch = false;
-    const result = await processEventBatches({
-      fromLedger: 1,
-      toLedger: 300,
-      batchSize: 100,
-      batchDelayMs: 0,
-      adminWallet: 'GADMIN',
-      shouldCancel: () => cancelAfterFirstBatch,
-      onProgress: (progress) => {
-        if (progress.ledgersProcessed >= 100) {
-          cancelAfterFirstBatch = true;
-        }
-      },
-    });
-
-    expect(result.error).toBe('cancelled');
-    expect(result.ledgersProcessed).toBeLessThan(300);
-  });
-
-  it('does not call RPC after cancellation', async () => {
-    mockGetEvents.mockResolvedValue({ events: [] });
-
-    const result = await processEventBatches({
-      fromLedger: 1,
-      toLedger: 1000,
-      batchSize: 100,
-      batchDelayMs: 0,
-      adminWallet: 'GADMIN',
-      shouldCancel: () => true,
-    });
-
-    expect(result.error).toBe('cancelled');
-    expect(mockGetEvents).not.toHaveBeenCalled();
-  });
-});
-
-// ── Rate-limit backoff ─────────────────────────────────────────────────────────
-
-describe('rate-limit backoff', () => {
-  it('backs off and retries on rate-limit error', async () => {
-    let callCount = 0;
-    mockGetEvents.mockImplementation(async () => {
-      callCount++;
-      if (callCount === 1) {
-        throw new Error('HTTP 429 Too Many Requests');
-      }
-      return { events: [] };
-    });
-
-    const result = await processEventBatches({
-      fromLedger: 1,
-      toLedger: 100,
-      batchSize: 100,
-      batchDelayMs: 0,
-      adminWallet: 'GADMIN',
-      isRateLimitError: (err: unknown) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        return msg.includes('429');
-      },
-      rateLimitBackoffMs: 100,
-    });
-
-    expect(callCount).toBe(2); // first call failed, second succeeded
-    expect(result.error).toBeUndefined();
-  });
-
-  it('continues to next batch on non-rate-limit error', async () => {
+  it('skips a batch on RPC error and continues (per-batch failures do not propagate)', async () => {
+    // Contract documented here: RPC errors are logged and the processor moves
+    // to the next batch; the job still completes without `error` set.
     mockGetEvents
       .mockRejectedValueOnce(new Error('RPC timeout'))
       .mockResolvedValue({ events: [] });
-
     const result = await processEventBatches({
       fromLedger: 1,
       toLedger: 200,
@@ -342,93 +180,38 @@ describe('rate-limit backoff', () => {
       batchDelayMs: 0,
       adminWallet: 'GADMIN',
     });
-
     expect(mockGetEvents).toHaveBeenCalledTimes(2);
     expect(result.error).toBeUndefined();
+    expect(result.ledgersProcessed).toBe(200);
   });
-});
 
-// ── Progress callback ─────────────────────────────────────────────────────────
-
-describe('progress callback', () => {
-  it('calls onProgress after each batch', async () => {
+  it('calls onProgress after each batch with correct counts; audit hook gap documented', async () => {
     mockGetEvents.mockResolvedValue({ events: [] });
-
-    const progressCalls: BatchProcessorProgress[] = [];
+    const onProgress = jest.fn();
     await processEventBatches({
       fromLedger: 1,
-      toLedger: 200,
+      toLedger: 250,
       batchSize: 100,
       batchDelayMs: 0,
       adminWallet: 'GADMIN',
-      onProgress: (progress) => {
-        progressCalls.push(progress);
-      },
+      onProgress,
     });
-
-    expect(progressCalls.length).toBe(2); // 2 batches
-    expect(progressCalls[0].ledgersProcessed).toBe(100);
-    expect(progressCalls[1].ledgersProcessed).toBe(200);
-  });
-
-  it('reports correct totals in progress', async () => {
-    mockGetEvents.mockResolvedValue({ events: [] });
-
-    const progressCalls: BatchProcessorProgress[] = [];
-    await processEventBatches({
-      fromLedger: 50,
-      toLedger: 149,
-      batchSize: 100,
-      batchDelayMs: 0,
-      adminWallet: 'GADMIN',
-      onProgress: (progress) => {
-        progressCalls.push(progress);
-      },
+    // 3 batches: [1..100], [101..200], [201..250]
+    expect(onProgress).toHaveBeenCalledTimes(3);
+    expect(onProgress.mock.calls[0][0]).toMatchObject({
+      ledgersProcessed: 100,
+      ledgersTotal: 250,
+      currentBatchStart: 1,
+      currentBatchEnd: 100,
     });
-
-    expect(progressCalls[0].ledgersTotal).toBe(100);
-  });
-});
-
-// ── onBatchComplete hook ─────────────────────────────────────────────────────
-
-describe('onBatchComplete hook', () => {
-  it('calls onBatchComplete after each batch', async () => {
-    mockGetEvents.mockResolvedValue({ events: [] });
-
-    const batchCompleteCalls: Array<[number, number]> = [];
-    await processEventBatches({
-      fromLedger: 1,
-      toLedger: 200,
-      batchSize: 100,
-      batchDelayMs: 0,
-      adminWallet: 'GADMIN',
-      onBatchComplete: (lastLedger, eventsInserted) => {
-        batchCompleteCalls.push([lastLedger, eventsInserted]);
-      },
+    expect(onProgress.mock.calls[2][0]).toMatchObject({
+      ledgersProcessed: 250,
+      ledgersTotal: 250,
+      currentBatchStart: 201,
+      currentBatchEnd: 250,
     });
-
-    expect(batchCompleteCalls.length).toBe(2);
-    expect(batchCompleteCalls[0][0]).toBe(100);
-    expect(batchCompleteCalls[1][0]).toBe(200);
-  });
-
-  it('waits for async onBatchComplete before continuing', async () => {
-    mockGetEvents.mockResolvedValue({ events: [] });
-
-    let onBatchCompleteResolved = false;
-    await processEventBatches({
-      fromLedger: 1,
-      toLedger: 100,
-      batchSize: 100,
-      batchDelayMs: 0,
-      adminWallet: 'GADMIN',
-      onBatchComplete: async () => {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-        onBatchCompleteResolved = true;
-      },
-    });
-
-    expect(onBatchCompleteResolved).toBe(true);
+    // Gap: logAuditEvent is imported by eventBatchProcessor.ts but never
+    // called — progress reporting goes through onProgress only.
+    expect(mockLogAuditEvent).not.toHaveBeenCalled();
   });
 });

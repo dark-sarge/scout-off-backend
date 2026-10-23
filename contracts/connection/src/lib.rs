@@ -93,6 +93,13 @@ pub struct ConnectionContract;
 
 #[contractimpl]
 impl ConnectionContract {
+    /// Return the contract's semantic version as `(major, minor, patch)`.
+    ///
+    /// Read-only, auth-free. Used by the backend at startup for compatibility checks.
+    pub fn version(_env: Env) -> (u32, u32, u32) {
+        (0, 1, 0)
+    }
+
     /// One-time contract setup.
     pub fn initialize(
         env: Env,
@@ -278,7 +285,7 @@ impl ConnectionContract {
         Ok(())
     }
 
-    /// Return the ConnectionRecord for (scout, player_id), or PlayerNotFound if none.
+    /// Return the ConnectionRecord for (scout, player_id), or ConnectionNotFound if none.
     pub fn get_connection(
         env: Env,
         scout: Address,
@@ -287,7 +294,7 @@ impl ConnectionContract {
         env.storage()
             .instance()
             .get(&DataKey::Connection(scout, player_id))
-            .ok_or(Error::PlayerNotFound)
+            .ok_or(Error::ConnectionNotFound)
     }
 
     /// Return all connection records for a scout.
@@ -341,15 +348,19 @@ impl ConnectionContract {
             (r, conn_key)
         } else if caller == stored_admin {
             // Admin path: scan all scout connections to find this player_id.
-            // Since we don't have a global index, return PlayerNotFound for now.
+            // Since we don't have a global index, return ConnectionNotFound for now.
             // In production, admin would pass the scout address explicitly.
-            return Err(Error::PlayerNotFound);
+            return Err(Error::ConnectionNotFound);
         } else {
-            return Err(Error::PlayerNotFound);
+            return Err(Error::ConnectionNotFound);
         };
 
         if record.scout != caller && caller != stored_admin {
             return Err(Error::Unauthorized);
+        }
+
+        if record.status == ConnectionStatus::Closed {
+            return Err(Error::ConnectionAlreadyClosed);
         }
 
         let mut updated = record;
@@ -1108,5 +1119,13 @@ mod tests {
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
         }
+    }
+
+    #[test]
+    fn version_returns_semver_tuple() {
+        let env = Env::default();
+        let (client, _reg, _sub, _admin, _token_addr) = setup(&env);
+        let (major, _minor, _patch) = client.version();
+        assert_eq!(major, 0);
     }
 }
